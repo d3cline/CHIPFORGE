@@ -1,0 +1,13 @@
+"DepotBuildConfig"
+{
+    "DepotID"          "YOUR_DEPOT_ID"
+    "ContentRoot"      "../steam-depot"
+    "FileMapping"
+    {
+        "LocalPath"    "CHIPFORGE/*"
+        "DepotPath"    "."
+        "recursive"    "1"
+    }
+    "FileExclusion"    "*.pdb"
+    "FileExclusion"    "*.pyc"
+}

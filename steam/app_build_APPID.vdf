@@ -1,0 +1,13 @@
+"appbuild"
+{
+    "appid"            "YOUR_APP_ID"
+    "desc"             "CHIPFORGE Linux alpha"
+    "buildoutput"      "../output"
+    "contentroot"      "../steam-depot"
+    "setlive"          "alpha"
+    "preview"          "0"
+    "depots"
+    {
+        "YOUR_DEPOT_ID" "depot_build_DEPOTID.vdf"
+    }
+}
