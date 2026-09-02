@@ -16,14 +16,15 @@ from tkinter import filedialog, messagebox, ttk
 import numpy as np
 
 from chipforge_st import (
-    CHANNEL_COUNT, CHANNEL_NAMES, DRUM_CHANNELS, LOFI_STYLE_NAMES, NOTE_KEYS, NOTE_OFFSETS, STYLES,
-    VAPORWAVE_STYLE_NAMES, WAVEFORMS, Step,
+    CHANNEL_COUNT, CHANNEL_NAMES, DRUM_CHANNELS, LOFI_STYLE_NAMES, NOTE_KEYS, NOTE_OFFSETS,
+    SONG_PATHS, SONG_PATH_SCENE_NAMES, STYLES,
+    VAPORWAVE_STYLE_NAMES, VOX_AUTOMATION, VOX_MODES, VOX_PAD_ACTIONS, VOX_PAD_LABELS, VOX_VOICES, VOX_WORDS, WAVEFORMS, Step,
     SynthCore, TrackerProject, clamp, export_project, generate_song,
-    midi_name, mutate_song, render_project, theme_variation, write_wav,
+    build_song_scene, generate_vox_loop, generate_vox_phrase, midi_name, mutate_song, parse_vox_words, render_project, theme_variation, write_wav,
 )
 
 APP = "CHIPFORGE WORKSTATION"
-VERSION = "2.6.4-cherry-release"
+VERSION = "3.4.1-word-pads"
 MONO = "DejaVu Sans Mono"
 BG, PANEL, GRID = "#05070a", "#0b1118", "#173044"
 CYAN, PINK, LIME, AMBER, WHITE, MUTED = "#3df6ff", "#ff3cac", "#8cff5a", "#ffc857", "#edfaff", "#68869a"
@@ -402,9 +403,14 @@ class Visualizer(tk.Canvas):
 
 class Workstation:
     AUTO_LOOP_INTERVALS = (0, 1, 2, 4)  # off, then every 4/8/16 bars
+    # Tk interprets width/height as pixels when a button also has an image.
+    # Keep these large enough for the slot number, glyph and full word.
+    VOX_WORD_BUTTON_WIDTH = 132
+    VOX_WORD_BUTTON_HEIGHT = 32
     GLOBAL_HOTKEYS = "GLOBAL  F1 HELP  |  F6 FOCUS / TAKEOVER SWAP  |  F11 FULLSCREEN  |  ESC BACK"
     MUSIC_HOTKEYS = (
-        "MUSIC COMMANDS (INSERT OFF)  SPACE PLAY  |  G GENERATE  M MUTATE  Y STYLE  A AUTO  F FLOW  "
+        "MUSIC COMMANDS (INSERT OFF)  SPACE PLAY  |  G GENERATE  M MUTATE  Y ALL STYLES  A EVOLVE  F FLOW  "
+        "P PATH  N CUE NEXT  O RETURN  T LOOP SCENE  |  7 SOUNDBOARD  V STAB  B DIVE  |  "
         "I INSERT  W FORGE  S SAVE  E EXPORT  H HELP"
     )
     EDIT_HOTKEYS = (
@@ -412,6 +418,7 @@ class Workstation:
         "INSERT ON: 2-6 OCTAVE  Z S X D C V G B H N J M , NOTES  BACKSPACE / DELETE ERASE  I EXIT"
     )
     VISUAL_HOTKEYS = "VISUAL  LEFT / RIGHT SCENE  |  R MUTATE  L LOOK  E FX  8 PIXEL  H HUD  F TAKEOVER"
+    SOUNDBOARD_HOTKEYS = "TRACK 7  1-8 FIRE PADS  |  Q NEW LOOP  R RANDOM WORDS  C CLEAR  A MODE  V VOICE  M BODY  ESC BACK"
 
     def __init__(self, args: argparse.Namespace):
         self.args=args; self.root=tk.Tk(); self.root.tk.call("tk", "scaling", 1.0); self.root.title(f"{APP} {VERSION}"); self.root.configure(bg=BG)
@@ -428,8 +435,13 @@ class Workstation:
         if not args.project.exists(): generate_song(self.project,self.style_index)
         self.core=SynthCore(self.project,args.sample_rate); self.audio=PipeWireOutput(self.core,args.no_audio)
         self.row=0; self.channel=0; self.page=0; self.octave=3; self.insert=False; self.focus_side="music"
-        self.theme_anchor=self.project.clone();self.auto_interval_index=0;self.auto_last_cycle=0;self.auto_variation=0
-        self.view_mode="split";self.flow_window:tk.Toplevel|None=None
+        self.theme_anchor=self.project.clone();self.song_path_anchor=self.project.clone();self.song_scenes=[]
+        self.song_scene_index=0;self.song_path_queued=None;self.song_path_event=None
+        self.path_hold=not self.project.song_path_enabled
+        self.auto_interval_index=0;self.auto_last_cycle=0;self.auto_variation=0
+        self.vox_variation=0;self.vox_selected_action="WUB"
+        self._rebuild_song_path();self.core.cycle_callback=self._audio_cycle_boundary;self.core.bar_callback=self._audio_bar_boundary
+        self.view_mode="split";self.flow_window:tk.Toplevel|None=None;self.path_window:tk.Toplevel|None=None;self.style_window:tk.Toplevel|None=None;self.transition_busy=False
         self.state_slot=tk.IntVar(value=0)
         self.status=tk.StringVar(value="READY"); self.bpm=tk.IntVar(value=self.project.bpm); self.swing=tk.DoubleVar(value=self.project.swing)
         self.randomness=tk.DoubleVar(value=self.project.randomness*100);self.harmonic_motion=tk.DoubleVar(value=self.project.harmonic_motion*100)
@@ -451,9 +463,10 @@ class Workstation:
         self._button_icons.append(image);return image
     def button(self,parent,text,command,color=CYAN,glyph="spark",**kw):
         image=self.glyph(parent,glyph,color)
-        return tk.Button(parent,text=text,image=image,compound="left",command=command,bg=PANEL,fg=color,
-                         activebackground=color,activeforeground=BG,relief="flat",bd=0,padx=8,pady=5,
-                         font=(MONO,9,"bold"),**kw)
+        options={"bg":PANEL,"fg":color,"activebackground":color,"activeforeground":BG,
+                 "relief":"flat","bd":0,"padx":8,"pady":5,"font":(MONO,9,"bold")}
+        options.update(kw)
+        return tk.Button(parent,text=text,image=image,compound="left",command=command,**options)
     def build(self):
         top=tk.Frame(self.root,bg=BG);top.pack(fill="x",padx=8,pady=(8,4))
         tk.Label(top,text="CHIPFORGE",fg=CYAN,bg=BG,font=(MONO,17,"bold")).pack(side="left")
@@ -464,12 +477,13 @@ class Workstation:
         self.pane.pack(fill="both",expand=True,padx=8,pady=4)
         self.music=tk.Frame(self.pane,bg=PANEL,highlightbackground=GRID,highlightthickness=1)
         self.visual=tk.Frame(self.pane,bg=PANEL,highlightbackground=GRID,highlightthickness=1)
+        self.soundboard=tk.Frame(self.pane,bg="#100912",highlightbackground=PINK,highlightthickness=1)
         self.pane.add(self.music,stretch="always",minsize=430); self.pane.add(self.visual,stretch="always",minsize=430)
-        self.build_music();self.build_visual()
+        self.build_music();self.build_visual();self.build_soundboard()
         foot=tk.Frame(self.root,bg=BG,highlightbackground=GRID,highlightthickness=1);foot.pack(fill="x",padx=8,pady=(4,8))
         legend=tk.Frame(foot,bg=BG);legend.pack(side="left",fill="x",expand=True,padx=7,pady=4)
         self.hotkey_labels=[]
-        for line,color in ((self.GLOBAL_HOTKEYS,AMBER),(self.MUSIC_HOTKEYS,CYAN),(self.EDIT_HOTKEYS,MUTED),(self.VISUAL_HOTKEYS,PINK)):
+        for line,color in ((self.GLOBAL_HOTKEYS,AMBER),(self.MUSIC_HOTKEYS,CYAN),(self.EDIT_HOTKEYS,MUTED),(self.VISUAL_HOTKEYS,PINK),(self.SOUNDBOARD_HOTKEYS,LIME)):
             label=tk.Label(legend,text=line,fg=color,bg=BG,font=(MONO,7,"bold"),anchor="w",justify="left")
             label.pack(fill="x");self.hotkey_labels.append(label)
         def wrap_hotkeys(event):
@@ -480,7 +494,7 @@ class Workstation:
 
     def build_music(self):
         bar=tk.Frame(self.music,bg=PANEL);bar.pack(fill="x",padx=8,pady=8)
-        for text,cmd,col,glyph in (("PLAY",self.toggle,LIME,"play"),("GENERATE",self.generate,CYAN,"spark"),("MUTATE",self.mutate,PINK,"cycle"),("STYLE",self.style,AMBER,"diamond")):
+        for text,cmd,col,glyph in (("PLAY",self.toggle,LIME,"play"),("GENERATE",self.generate,CYAN,"spark"),("MUTATE",self.mutate,PINK,"cycle"),("ALL STYLES",self.open_style_picker,AMBER,"diamond")):
             button=self.button(bar,text,cmd,col,glyph);button.pack(side="left",padx=2)
             if glyph=="play":self.play_btn=button
         tk.Label(bar,text="STATE",fg=MUTED,bg=PANEL,font=(MONO,9,"bold")).pack(side="left",padx=(8,2))
@@ -491,14 +505,30 @@ class Workstation:
         self.button(bar,"EXPORT",self.export,LIME,"download").pack(side="left",padx=2)
         self.button(bar,"WAVE FORGE",self.open_forge,AMBER,"hammer").pack(side="right",padx=2)
         banks=tk.Frame(self.music,bg=PANEL);banks.pack(fill="x",padx=10,pady=(0,4))
-        tk.Label(banks,text="PRESET BANK",fg=MUTED,bg=PANEL,font=(MONO,8,"bold")).pack(side="left",padx=(0,5))
+        bank_top=tk.Frame(banks,bg=PANEL);bank_top.pack(fill="x")
+        tk.Label(bank_top,text="LIVE BANKS",fg=MUTED,bg=PANEL,font=(MONO,8,"bold")).pack(side="left",padx=(0,5))
         for text,style_name,color in (("CHIPTUNE","NEON NOIR",CYAN),("808","808 BOOM BAP",AMBER),
                                       ("VAPOR","MALL AFTER MIDNIGHT",PINK),("LO-FI","RAINY WINDOW BEATS",LIME)):
-            self.button(banks,text,lambda name=style_name:self.jump_style(name),color,"chip").pack(side="left",padx=2)
-        self.auto_btn=self.button(banks,"AUTO OFF",self.cycle_auto_mutate,PINK,"clock")
-        self.auto_btn.pack(side="right",padx=2)
-        self.tracks_btn=self.button(banks,"4 CORE",self.toggle_tracks,AMBER,"lanes");self.tracks_btn.pack(side="right",padx=2)
-        self.flow_btn=self.button(banks,"FLOW LAB",self.open_flow_lab,CYAN,"wave");self.flow_btn.pack(side="right",padx=2)
+            self.button(bank_top,text,lambda name=style_name:self.jump_style(name),color,"chip").pack(side="left",padx=2)
+        bank_bottom=tk.Frame(banks,bg=PANEL);bank_bottom.pack(fill="x",pady=(3,0))
+        tk.Label(bank_bottom,text="CLUB BANKS",fg=MUTED,bg=PANEL,font=(MONO,8,"bold")).pack(side="left",padx=(0,5))
+        for text,style_name,color in (("TECHNO","WAREHOUSE PULSE",PINK),("HOUSE","MIDNIGHT HOUSE",LIME),
+                                      ("DNB","JUNGLE CIRCUIT",AMBER),("SYNTH","NIGHTDRIVE 84",CYAN)):
+            self.button(bank_bottom,text,lambda name=style_name:self.jump_style(name),color,"chip").pack(side="left",padx=2)
+        self.tracks_btn=self.button(bank_bottom,"4 CORE",self.toggle_tracks,AMBER,"lanes");self.tracks_btn.pack(side="right",padx=2)
+        self.flow_btn=self.button(bank_bottom,"FLOW LAB",self.open_flow_lab,CYAN,"wave");self.flow_btn.pack(side="right",padx=2)
+        arranger=tk.Frame(self.music,bg="#0d1822",highlightbackground=CYAN,highlightthickness=1);arranger.pack(fill="x",padx=10,pady=(2,5))
+        arrange_bar=tk.Frame(arranger,bg="#0d1822");arrange_bar.pack(fill="x",padx=5,pady=(3,0))
+        tk.Label(arrange_bar,text="SONG MAP",fg=CYAN,bg="#0d1822",font=(MONO,10,"bold")).pack(side="left",padx=(2,5))
+        self.path_btn=self.button(arrange_bar,f"PATH {self.project.song_path}",self.open_song_path_picker,PINK,"diamond");self.path_btn.pack(side="left",padx=2)
+        self.path_hold_btn=self.button(arrange_bar,"LOOP SCENE",self.toggle_path_hold,AMBER,"clock");self.path_hold_btn.pack(side="left",padx=2)
+        self.path_next_btn=self.button(arrange_bar,"CUE NEXT",self.queue_next_scene,LIME,"right");self.path_next_btn.pack(side="left",padx=2)
+        self.path_home_btn=self.button(arrange_bar,"RETURN HOME",self.queue_home_scene,CYAN,"cycle");self.path_home_btn.pack(side="left",padx=2)
+        evolve_bar=tk.Frame(arranger,bg="#0d1822");evolve_bar.pack(fill="x",padx=7,pady=(2,0))
+        tk.Label(evolve_bar,text="PATH MOVES THE HARMONY  •  EVOLVE CHANGES DRUMS, FILLS + MELODY DETAILS",fg=MUTED,bg="#0d1822",font=(MONO,8,"bold"),anchor="w").pack(side="left",fill="x",expand=True)
+        self.auto_btn=self.button(evolve_bar,"EVOLVE OFF",self.cycle_auto_mutate,PINK,"wave");self.auto_btn.pack(side="right",padx=2)
+        self.path_map=tk.Canvas(arranger,height=72,bg="#081018",highlightthickness=0);self.path_map.pack(fill="x",padx=5,pady=(3,5))
+        self.build_vox_deck()
         opts=tk.Frame(self.music,bg=PANEL);opts.pack(fill="x",padx=10)
         tk.Label(opts,text="BPM",fg=MUTED,bg=PANEL).pack(side="left")
         tk.Scale(opts,from_=40,to=240,orient="horizontal",variable=self.bpm,command=self.change_tempo,bg=PANEL,fg=WHITE,troughcolor=GRID,highlightthickness=0,length=150).pack(side="left")
@@ -509,9 +539,101 @@ class Workstation:
         self.tracker=tk.Canvas(self.music,bg=BG,highlightthickness=1,highlightbackground=GRID);self.tracker.pack(fill="both",expand=True,padx=8,pady=5)
         nav=tk.Frame(self.music,bg=PANEL);nav.pack(fill="x",padx=8,pady=(2,8))
         self.page_label=tk.Label(nav,text="PAGE 1 / 4",fg=AMBER,bg=PANEL,font=(MONO,10,"bold"));self.page_label.pack(side="left",padx=6)
+        self.page_nav_buttons=[]
         for text,cmd,glyph in (("PAGE",lambda:self.move_page(-1),"left"),("PAGE",lambda:self.move_page(1),"right"),("CLEAR CHANNEL",self.clear_channel,"clear"),("AUDITION",self.audition,"speaker")):
-            self.button(nav,text,cmd,WHITE,glyph).pack(side="left",padx=2)
-        self.meters=tk.Canvas(nav,width=186,height=30,bg=BG,highlightthickness=0);self.meters.pack(side="right")
+            button=self.button(nav,text,cmd,WHITE,glyph);button.pack(side="left",padx=2)
+            if text=="PAGE":self.page_nav_buttons.append(button)
+        self.meters=tk.Canvas(nav,width=217,height=30,bg=BG,highlightthickness=0);self.meters.pack(side="right")
+
+    def build_vox_deck(self):
+        deck=tk.Frame(self.music,bg="#1a0b19",highlightbackground=PINK,highlightthickness=1);deck.pack(fill="x",padx=10,pady=(0,5))
+        tk.Label(deck,text="TRACK 7 // SOUNDBOARD",fg=PINK,bg="#1a0b19",font=(MONO,10,"bold")).pack(side="left",padx=(8,6),pady=5)
+        self.vox_phrase=tk.Label(deck,text="",fg=WHITE,bg="#1a0b19",font=(MONO,8,"bold"),anchor="w")
+        self.vox_phrase.pack(side="left",fill="x",expand=True,padx=4)
+        self.vox_auto_btn=self.button(deck,"LOOP",self.cycle_vox_auto,LIME,"cycle");self.vox_auto_btn.pack(side="right",padx=2,pady=3)
+        self.vox_mute_btn=self.button(deck,"MUTE",self.vox_mute,WHITE,"speaker");self.vox_mute_btn.pack(side="right",padx=2,pady=3)
+        self.button(deck,"OPEN BOARD",self.toggle_soundboard_view,PINK,"grid").pack(side="right",padx=2,pady=3)
+
+    def build_soundboard(self):
+        top=tk.Frame(self.soundboard,bg="#100912");top.pack(fill="x",padx=16,pady=(16,8))
+        tk.Label(top,text="TRACK 7 // FOUR-BAR SOUNDBOARD",fg=PINK,bg="#100912",font=(MONO,16,"bold")).pack(side="left")
+        self.button(top,"BACK TO SPLIT",lambda:self.set_view("split"),AMBER,"left").pack(side="right",padx=2)
+        self.board_mute_btn=self.button(top,"MUTE",self.vox_mute,WHITE,"speaker");self.board_mute_btn.pack(side="right",padx=2)
+
+        identity=tk.Frame(self.soundboard,bg="#1a0b19",highlightbackground=PINK,highlightthickness=1);identity.pack(fill="x",padx=16,pady=5)
+        self.board_phrase=tk.Label(identity,text="",fg=WHITE,bg="#1a0b19",font=(MONO,12,"bold"),anchor="w")
+        self.board_phrase.pack(side="left",fill="x",expand=True,padx=10,pady=8)
+        self.board_voice_btn=self.button(identity,"VOICE  WOBBLE",self.cycle_vox_voice,CYAN,"chip");self.board_voice_btn.pack(side="right",padx=2)
+        self.board_mode_btn=self.button(identity,"BODY  PUNCH",self.cycle_vox_mode,AMBER,"wave");self.board_mode_btn.pack(side="right",padx=2)
+
+        words_box=tk.Frame(self.soundboard,bg="#13101a",highlightbackground=AMBER,highlightthickness=1);words_box.pack(fill="x",padx=16,pady=5)
+        tk.Label(words_box,text="VOCAL WORDS // 1–3",fg=AMBER,bg="#13101a",font=(MONO,10,"bold")).pack(side="left",padx=9,pady=7)
+        self.vox_word_buttons=[]
+        for slot,color in enumerate((LIME,CYAN,PINK)):
+            button=self.button(
+                words_box,f"WORD {slot+1}",lambda index=slot:self.cycle_vox_word(index),color,"speaker",
+                width=self.VOX_WORD_BUTTON_WIDTH,height=self.VOX_WORD_BUTTON_HEIGHT,
+                padx=12,pady=4,font=(MONO,11,"bold"),anchor="center",relief="solid",bd=1,
+            )
+            button.pack(side="left",padx=3,pady=4);self.vox_word_buttons.append(button)
+        self.button(words_box,"RANDOMIZE WORDS",self.randomize_vox_words,PINK,"spark").pack(side="right",padx=3,pady=4)
+        self.vox_remove_word_btn=self.button(words_box,"REMOVE LAST",self.remove_vox_word,WHITE,"clear");self.vox_remove_word_btn.pack(side="right",padx=3,pady=4)
+        tk.Label(words_box,text="1 = STAB  ·  2 = DEFAULT  ·  3 = CHANT",fg=MUTED,bg="#13101a",font=(MONO,8,"bold")).pack(side="right",padx=10)
+
+        pad_wrap=tk.Frame(self.soundboard,bg="#100912");pad_wrap.pack(fill="x",padx=16,pady=8)
+
+        mode_box=tk.Frame(pad_wrap,bg="#0d1822",highlightbackground=CYAN,highlightthickness=1);mode_box.pack(fill="x",pady=(0,10))
+        tk.Label(mode_box,text="PLAY MODE",fg=CYAN,bg="#0d1822",font=(MONO,10,"bold")).pack(side="left",padx=9,pady=7)
+        self.board_automation_buttons={}
+        for mode,text,color in (("OFF","LIVE ONLY",WHITE),("LOOP","LOOP ON",LIME),("AUTO","AUTO VARIATION",PINK)):
+            button=self.button(mode_box,text,lambda value=mode:self.set_vox_automation(value),color,"cycle")
+            button.pack(side="left",padx=3,pady=4);self.board_automation_buttons[mode]=button
+        self.board_automation_help=tk.Label(mode_box,text="",fg=MUTED,bg="#0d1822",font=(MONO,9,"bold"),anchor="e")
+        self.board_automation_help.pack(side="right",fill="x",expand=True,padx=10)
+
+        perform=tk.Frame(pad_wrap,bg="#100912")
+        perform.pack(fill="x")
+        tk.Label(perform,text="PERFORM // TAP A PAD: IT FIRES ON THE SONG CLOCK AND BECOMES THE PAD YOU CAN PLACE BELOW",fg=MUTED,bg="#100912",font=(MONO,9,"bold")).pack(anchor="w",pady=(0,5))
+        pads=tk.Frame(perform,bg="#100912");pads.pack(fill="x")
+        self.vox_pad_buttons={}
+        colors=(LIME,PINK,AMBER,PINK,CYAN,AMBER,LIME,CYAN)
+        glyphs=("speaker","diamond","clear","hammer","wave","clock","right","cycle")
+        for index,action in enumerate(VOX_PAD_ACTIONS):
+            label=f"{index+1}  {VOX_PAD_LABELS[action]}"
+            button=self.button(pads,label,lambda value=action:self.select_vox_pad(value,True),colors[index],glyphs[index],
+                               pady=11,font=(MONO,11,"bold"))
+            button.grid(row=index//4,column=index%4,sticky="nsew",padx=4,pady=4)
+            self.vox_pad_buttons[action]=button
+        for column in range(4):pads.grid_columnconfigure(column,weight=1)
+
+        loop_head=tk.Frame(pad_wrap,bg="#100912");loop_head.pack(fill="x",pady=(15,5))
+        tk.Label(loop_head,text="PROGRAM // FOUR BARS · FOUR BEATS EACH",fg=PINK,bg="#100912",font=(MONO,10,"bold")).pack(side="left")
+        self.vox_selected_label=tk.Label(loop_head,text="",fg=CYAN,bg="#100912",font=(MONO,9,"bold"));self.vox_selected_label.pack(side="left",padx=14)
+        self.button(loop_head,"RANDOMIZE LOOP",self.new_vox_pattern,PINK,"spark").pack(side="right",padx=2)
+        self.button(loop_head,"CLEAR ALL",self.clear_vox_pattern,WHITE,"clear").pack(side="right",padx=2)
+        self.board_loop_summary=tk.Label(loop_head,text="",fg=MUTED,bg="#100912",font=(MONO,8,"bold"));self.board_loop_summary.pack(side="right",padx=10)
+
+        loop_grid=tk.Frame(pad_wrap,bg="#100912");loop_grid.pack(fill="x")
+        self.vox_loop_buttons=[]
+        for bar in range(4):
+            bar_box=tk.Frame(loop_grid,bg="#120f18",highlightbackground=GRID,highlightthickness=1)
+            bar_box.grid(row=0,column=bar,sticky="nsew",padx=4)
+            tk.Label(bar_box,text=f"BAR {bar+1}",fg=AMBER,bg="#120f18",font=(MONO,9,"bold")).pack(fill="x",pady=(5,2))
+            beats=tk.Frame(bar_box,bg="#120f18");beats.pack(fill="x",padx=4,pady=(0,5))
+            for beat in range(4):
+                index=bar*4+beat
+                button=tk.Button(beats,text=f"{beat+1}\n—",command=lambda cell=index:self.toggle_vox_step(cell),
+                                 bg=PANEL,fg=MUTED,activebackground=PINK,activeforeground=BG,
+                                 relief="flat",bd=0,padx=4,pady=8,font=(MONO,10,"bold"),height=2)
+                button.pack(side="left",fill="x",expand=True,padx=2)
+                self.vox_loop_buttons.append(button)
+        for column in range(4):loop_grid.grid_columnconfigure(column,weight=1)
+
+        guide=tk.Frame(pad_wrap,bg="#0b1118",highlightbackground=GRID,highlightthickness=1);guide.pack(fill="x",pady=(12,0))
+        for number,title,detail,color in (("1","TAP A PAD","Hear it on the next beat",LIME),("2","CLICK A BEAT","Empty adds it; filled removes it",CYAN),("3","CHOOSE MODE","Loop it yourself or let Auto vary it",PINK)):
+            card=tk.Frame(guide,bg="#0b1118");card.pack(side="left",fill="x",expand=True,padx=10,pady=7)
+            tk.Label(card,text=f"{number}  {title}",fg=color,bg="#0b1118",font=(MONO,9,"bold")).pack(anchor="w")
+            tk.Label(card,text=detail,fg=MUTED,bg="#0b1118",font=(MONO,8)).pack(anchor="w")
 
     def build_visual(self):
         bar=tk.Frame(self.visual,bg=PANEL);bar.pack(fill="x",padx=8,pady=8)
@@ -527,6 +649,16 @@ class Workstation:
     def key(self,e):
         k=e.keysym; ch=e.char
         if k in ("F6","F11","F1","Escape"):return
+        if self.focus_side=="soundboard":
+            if ch in "12345678":self.select_vox_pad(VOX_PAD_ACTIONS[int(ch)-1],True)
+            elif ch.lower()=="q":self.new_vox_pattern()
+            elif ch.lower()=="r":self.randomize_vox_words()
+            elif ch.lower()=="c":self.clear_vox_pattern()
+            elif ch.lower()=="a":self.cycle_vox_auto()
+            elif ch.lower()=="v":self.cycle_vox_voice()
+            elif ch.lower()=="m":self.cycle_vox_mode()
+            elif k=="space":self.toggle()
+            return
         if self.focus_side=="visual":
             if k=="Left":self.vis.cycle_scene(-1)
             elif k=="Right":self.vis.cycle_scene(1)
@@ -552,7 +684,14 @@ class Workstation:
         elif ch.lower()=="g":self.generate()
         elif ch.lower()=="m":self.mutate()
         elif ch.lower()=="a":self.cycle_auto_mutate()
-        elif ch.lower()=="y":self.style()
+        elif ch.lower()=="p":self.open_song_path_picker()
+        elif ch.lower()=="n":self.queue_next_scene()
+        elif ch.lower()=="o":self.queue_home_scene()
+        elif ch.lower()=="t":self.toggle_path_hold()
+        elif ch=="7":self.toggle_soundboard_view()
+        elif ch.lower()=="v":self.vox_call()
+        elif ch.lower()=="b":self.vox_bend()
+        elif ch.lower()=="y":self.open_style_picker()
         elif ch.lower()=="w":self.open_forge()
         elif ch.lower()=="s":self.save_state()
         elif ch.lower()=="e":self.export()
@@ -563,10 +702,12 @@ class Workstation:
         self.focus_side=side
         self.music.configure(highlightbackground=LIME if side=="music" else GRID,highlightthickness=2 if side=="music" else 1)
         self.visual.configure(highlightbackground=PINK if side=="visual" else GRID,highlightthickness=2 if side=="visual" else 1)
+        self.soundboard.configure(highlightbackground=PINK if side=="soundboard" else GRID,highlightthickness=2 if side=="soundboard" else 1)
         self.status.set(f"FOCUS: {side.upper()}")
     def switch_focus(self):
         if self.view_mode=="deck":self.set_view("visual")
         elif self.view_mode=="visual":self.set_view("deck")
+        elif self.view_mode=="soundboard":self.set_view("deck")
         else:self.set_focus("visual" if self.focus_side=="music" else "music")
     def escape(self):
         try:fullscreen=bool(int(self.root.attributes("-fullscreen")))
@@ -578,27 +719,163 @@ class Workstation:
         except (TypeError,ValueError,tk.TclError):active=False
         self.root.attributes("-fullscreen",not active);self.status.set(f"APP FULLSCREEN {'OFF' if active else 'ON'}")
     def cycle_view(self):
-        modes=("split","deck","visual");self.set_view(modes[(modes.index(self.view_mode)+1)%len(modes)])
+        modes=("split","deck","visual","soundboard");self.set_view(modes[(modes.index(self.view_mode)+1)%len(modes)])
     def toggle_visual_view(self):self.set_view("split" if self.view_mode=="visual" else "visual")
     def toggle_deck_view(self):self.set_view("split" if self.view_mode=="deck" else "deck")
+    def toggle_soundboard_view(self):self.set_view("split" if self.view_mode=="soundboard" else "soundboard")
     def set_view(self,mode):
-        if mode not in ("split","deck","visual"):return
+        if mode not in ("split","deck","visual","soundboard"):return
         # Python 3.14/Tk 9 may return unhashable Tcl_Obj wrappers here instead
         # of ordinary strings. Normalize before membership tests so the view
         # toggle behaves identically across the development and Steam runtimes.
         managed={str(item) for item in self.pane.panes()}
-        for child in (self.music,self.visual):
+        for child in (self.music,self.visual,self.soundboard):
             if str(child) in managed:self.pane.forget(child)
         if mode in ("split","deck"):self.pane.add(self.music,stretch="always",minsize=430)
         if mode in ("split","visual"):self.pane.add(self.visual,stretch="always",minsize=430)
+        if mode=="soundboard":self.pane.add(self.soundboard,stretch="always",minsize=700)
         self.view_mode=mode;self.view_btn.configure(text=f"VIEW {mode.upper()}")
-        self.set_focus("visual" if mode=="visual" else "music")
+        self.set_focus("soundboard" if mode=="soundboard" else "visual" if mode=="visual" else "music")
         if mode=="split":self.root.after_idle(lambda:self.pane.sash_place(0,max(430,self.pane.winfo_width()//2),1))
-        self.status.set("SPLIT VIEW" if mode=="split" else "DECK TAKEOVER // ALL FOUR PAGES" if mode=="deck" else "VISUAL TAKEOVER")
+        self.status.set("SPLIT VIEW" if mode=="split" else "DECK TAKEOVER // ALL FOUR PAGES" if mode=="deck" else "VISUAL TAKEOVER" if mode=="visual" else "TRACK 7 SOUNDBOARD // FOUR-BAR LOOP")
     def toggle(self):
         self.core.toggle()
         self.play_btn.configure(text="STOP" if self.core.playing else "PLAY")
         self.status.set("PLAY" if self.core.playing else "STOP")
+    def cycle_vox_voice(self):
+        current=self.project.vox.voice if self.project.vox.voice in VOX_VOICES else VOX_VOICES[0]
+        self.project.vox.voice=VOX_VOICES[(VOX_VOICES.index(current)+1)%len(VOX_VOICES)]
+        self.status.set(f"VOX VOICE // {self.project.vox.voice}")
+    def cycle_vox_mode(self):
+        current=self.project.vox.mode if self.project.vox.mode in VOX_MODES else VOX_MODES[0]
+        self.project.vox.mode=VOX_MODES[(VOX_MODES.index(current)+1)%len(VOX_MODES)]
+        self.status.set(f"VOX MODE // {self.project.vox.mode}")
+    def cycle_vox_auto(self):
+        current=self.project.vox.automation if self.project.vox.automation in VOX_AUTOMATION else VOX_AUTOMATION[0]
+        self.set_vox_automation(VOX_AUTOMATION[(VOX_AUTOMATION.index(current)+1)%len(VOX_AUTOMATION)])
+    def set_vox_automation(self,mode):
+        if mode not in VOX_AUTOMATION:return
+        self.project.vox.automation=mode
+        detail={"OFF":"LIVE PADS ONLY","LOOP":"FIXED FOUR-BAR LOOP","AUTO":"NEW SPARSE LOOP EACH SONG SCENE"}[mode]
+        self.status.set(f"TRACK 7 {mode} // {detail}")
+    def vox_new_phrase(self,response=False,action="CALL"):
+        self.vox_variation=getattr(self,"vox_variation",0)+1
+        self.project.vox.phrase=generate_vox_phrase(self.project,self.vox_variation,response=response,action=action)
+        return self.project.vox.phrase
+    def new_vox_line(self):
+        self.randomize_vox_words()
+    def edit_vox_phrase(self):
+        # Retained as a compatibility entry point for older integrations.
+        self.randomize_vox_words()
+    def cycle_vox_word(self,index):
+        words=parse_vox_words(self.project.vox.phrase) or ["OH","AH"]
+        if index<len(words):
+            current=words[index];words[index]=VOX_WORDS[(VOX_WORDS.index(current)+1)%len(VOX_WORDS)]
+        elif index==len(words) and len(words)<3:
+            preferred=("AH","HEY","OH")
+            words.append(next((word for word in preferred if word!=words[-1]),"OH"))
+        else:return
+        self.project.vox.phrase=" / ".join(words[:3])
+        self.status.set(f"VOCAL WORDS // {self.project.vox.phrase}")
+    def remove_vox_word(self):
+        words=parse_vox_words(self.project.vox.phrase) or ["OH","AH"]
+        if len(words)<=1:
+            self.status.set("VOCAL WORDS // ONE WORD MINIMUM");return
+        words.pop();self.project.vox.phrase=" / ".join(words)
+        self.status.set(f"VOCAL WORDS // {self.project.vox.phrase}")
+    def randomize_vox_words(self):
+        phrase=self.vox_new_phrase();self.status.set(f"RANDOM VOCAL WORDS // {phrase}")
+    def new_vox_pattern(self):
+        self.vox_variation=getattr(self,"vox_variation",0)+1
+        self.project.vox.loop=generate_vox_loop(self.project,self.vox_variation)
+        self.status.set(f"NEW TRACK 7 LOOP // {sum(item!='---' for item in self.project.vox.loop)} HITS / 4 BARS // WORDS LOCKED {self.project.vox.phrase}")
+    def clear_vox_pattern(self):
+        self.project.vox.loop=["---"]*16;self.status.set("TRACK 7 LOOP CLEARED // LIVE PADS STILL READY")
+    def select_vox_pad(self,action,fire=False):
+        if action not in VOX_PAD_ACTIONS:return
+        self.vox_selected_action=action
+        if fire:self.trigger_vox_pad(action)
+    def trigger_vox_pad(self,action):
+        quantize="turn" if action=="HOOK" else "gap" if action=="ANSWER" else "beat"
+        self.core.queue_vox(action,quantize=quantize)
+        boundary="BEAT-FOUR PICKUP" if quantize=="turn" else "NEXT LEAD GAP" if quantize=="gap" else "NEXT BEAT"
+        self.status.set(f"PAD {VOX_PAD_LABELS[action]} QUEUED // {boundary}")
+    def toggle_vox_step(self,index):
+        if not 0<=index<16:return
+        action=self.vox_selected_action if self.vox_selected_action in VOX_PAD_ACTIONS else "WUB"
+        # A filled cell always clears in one click. An empty cell receives the
+        # last pad the performer touched; no invisible match-to-clear rule.
+        self.project.vox.loop[index]=action if self.project.vox.loop[index]=="---" else "---"
+        placed=self.project.vox.loop[index]
+        self.status.set(f"TRACK 7 BAR {index//4+1} BEAT {index%4+1} // {VOX_PAD_LABELS.get(placed,'CLEARED')}")
+    def vox_call(self):
+        self.select_vox_pad("CALL",True)
+    def vox_hook(self):
+        self.select_vox_pad("HOOK",True)
+    def vox_chop(self):
+        self.select_vox_pad("CHOP",True)
+    def vox_bend(self):
+        if self.core.vox.active:
+            self.core.vox.punch_bend();self.status.set("VOX LIVE BEND // PITCH FALL + CRUSH")
+        else:
+            self.select_vox_pad("BEND",True)
+    def vox_echo(self):
+        if self.core.vox.active:
+            self.core.vox.punch_echo();self.status.set("VOX THROW // LIVE")
+        else:
+            self.select_vox_pad("ECHO",True)
+    def vox_freeze(self):
+        self.select_vox_pad("FREEZE",True)
+    def vox_answer(self):
+        self.select_vox_pad("ANSWER",True)
+    def vox_mute(self):
+        self.project.vox.muted=not self.project.vox.muted
+        if self.project.vox.muted:self.core.vox.stop();self.core.vox_pending=None
+        self.status.set(f"VOX {'MUTED' if self.project.vox.muted else 'LIVE'}")
+    def update_vox_deck(self):
+        pending_action=self.core.vox_pending[0] if self.core.vox_pending else None
+        pending=f"  •  QUEUED {VOX_PAD_LABELS.get(pending_action,pending_action)}" if pending_action else ""
+        playing=f"  •  PLAYING {VOX_PAD_LABELS.get(self.core.vox.action,self.core.vox.action)}" if self.core.vox.active else ""
+        hits=[f"B{index//4+1}.{index%4+1} {VOX_PAD_LABELS[action]}" for index,action in enumerate(self.project.vox.loop) if action in VOX_PAD_ACTIONS]
+        summary=" · ".join(hits) if hits else "EMPTY LOOP"
+        self.vox_phrase.configure(text=f'{self.project.vox.voice}  //  {summary}{pending}{playing}')
+        self.vox_auto_btn.configure(text=self.project.vox.automation)
+        self.vox_mute_btn.configure(text="UNMUTE" if self.project.vox.muted else "MUTE")
+        hit_count=len(hits);hit_word="HIT" if hit_count==1 else "HITS"
+        self.board_phrase.configure(text=f'SHAPE  {self.project.vox.phrase}  //  {hit_count} {hit_word} / 4 BARS{pending}{playing}')
+        self.board_voice_btn.configure(text=f"VOICE  {self.project.vox.voice}");self.board_mode_btn.configure(text=f"BODY  {self.project.vox.mode}")
+        self.board_mute_btn.configure(text="UNMUTE" if self.project.vox.muted else "MUTE")
+        words=parse_vox_words(self.project.vox.phrase) or ["OH","AH"]
+        for index,button in enumerate(self.vox_word_buttons):
+            if index<len(words):
+                button.configure(text=f"{index+1}  ·  {words[index]}",state="normal",bg="#172119",relief="solid",bd=1)
+            elif index==len(words) and len(words)<3:
+                button.configure(text=f"{index+1}  ·  + ADD",state="normal",bg="#221b0f",relief="solid",bd=1)
+            else:
+                button.configure(text=f"{index+1}  ·  —",state="disabled",bg=PANEL,relief="flat",bd=0)
+        self.vox_remove_word_btn.configure(state="normal" if len(words)>1 else "disabled")
+        selected=self.vox_selected_action if self.vox_selected_action in VOX_PAD_ACTIONS else "WUB"
+        self.vox_selected_label.configure(text=f"LAST PAD: {VOX_PAD_LABELS[selected]}  //  CLICK EMPTY BEAT TO ADD")
+        mode=self.project.vox.automation
+        mode_help={"OFF":"Only pad taps play; the programmed loop is paused.",
+                   "LOOP":"The visible four-bar pattern repeats exactly.",
+                   "AUTO":"The pattern stays sparse and changes with each Song Map scene."}[mode]
+        self.board_automation_help.configure(text=mode_help)
+        for value,button in self.board_automation_buttons.items():
+            active=value==mode
+            button.configure(relief="solid" if active else "flat",bd=1 if active else 0,
+                             bg="#173326" if active else PANEL)
+        self.board_loop_summary.configure(text="CLICK FILLED BEAT = REMOVE")
+        live_beat=self.core.current_row//4 if self.core.playing else -1
+        for index,button in enumerate(self.vox_loop_buttons):
+            action=self.project.vox.loop[index]
+            occupied=action in VOX_PAD_ACTIONS
+            button.configure(text=f"{index%4+1}\n{VOX_PAD_LABELS.get(action,'—')}",
+                             fg=PINK if index==live_beat else CYAN if occupied else MUTED,
+                             bg="#2a1025" if index==live_beat else "#102329" if occupied else PANEL,
+                             relief="solid" if occupied else "flat",bd=1 if occupied else 0)
+        for action,button in self.vox_pad_buttons.items():
+            button.configure(relief="solid" if action==selected else "flat",bd=1 if action==selected else 0)
     def sync_flow_project(self):
         self.project.randomness=clamp(self.randomness.get()/100.0,0.0,1.0)
         self.project.harmonic_motion=clamp(self.harmonic_motion.get()/100.0,0.0,1.0)
@@ -607,7 +884,17 @@ class Workstation:
         self.project.track_count=6 if self.track_count.get()>=6 else 4
     def blend_style_index(self):
         return next((i for i,item in enumerate(STYLES) if item["name"]==self.project.blend_style),None)
+    def smooth_change(self,action,label="CHANGE"):
+        if self.transition_busy:return
+        self.transition_busy=True;self.status.set(f"{label} // CROSSFADING");self.core.set_output_gain(0.0)
+        def apply():
+            try:action()
+            finally:self.core.set_output_gain(1.0);self.root.after(180,self._finish_transition)
+        self.root.after(170,apply)
+    def _finish_transition(self):self.transition_busy=False
     def generate(self,seed=None):
+        self.smooth_change(lambda:self._generate_now(seed),"GENERATE")
+    def _generate_now(self,seed=None):
         self.sync_flow_project();self.core.stop()
         generate_song(self.project,self.style_index,seed=seed,randomness=self.project.randomness,
                       harmonic_motion=self.project.harmonic_motion,blend_style_index=self.blend_style_index(),
@@ -643,33 +930,164 @@ class Workstation:
         self.button(buttons,"CLOSE",closed,WHITE,"clear").pack(side="right")
         win.protocol("WM_DELETE_WINDOW",closed)
     def mutate(self):
+        self.smooth_change(self._mutate_now,"MUTATE")
+    def _mutate_now(self):
         self.sync_flow_project();amount=.06+self.project.randomness*.20
         with self.core.lock:changes=mutate_song(self.project,amount=amount);self.capture_theme()
         self.status.set(f"MUTATED {changes} EVENTS // NEW PRIMARY THEME")
-    def style(self):self.style_index=(self.style_index+1)%len(STYLES);self.generate()
+    def open_style_picker(self):
+        if self.style_window is not None and self.style_window.winfo_exists():self.style_window.lift();self.style_window.focus_force();return
+        win=tk.Toplevel(self.root,bg=BG);self.apply_window_icon(win);self.style_window=win;win.title("ALL CHIPFORGE STYLES");win.geometry("820x610");win.minsize(650,520)
+        tk.Label(win,text="ALL STYLES",fg=AMBER,bg=BG,font=(MONO,16,"bold")).pack(anchor="w",padx=18,pady=(18,4))
+        tk.Label(win,text="The bank buttons are fast live shortcuts. This chooser exposes every complete sound machine.",fg=MUTED,bg=BG,font=(MONO,9)).pack(anchor="w",padx=18,pady=(0,12))
+        grid=tk.Frame(win,bg=BG);grid.pack(fill="both",expand=True,padx=16)
+        for index,style in enumerate(STYLES):
+            current=index==self.style_index;color=LIME if current else CYAN
+            button=self.button(grid,style["name"],lambda name=style["name"]:self.jump_style(name),color,"chip",width=22,anchor="w")
+            button.grid(row=index//3,column=index%3,sticky="ew",padx=3,pady=3)
+        for column in range(3):grid.grid_columnconfigure(column,weight=1)
+        def closed():self.style_window=None;win.destroy()
+        self.button(win,"CLOSE",closed,WHITE,"clear").pack(anchor="e",padx=18,pady=12);win.protocol("WM_DELETE_WINDOW",closed)
+    def style(self):self.open_style_picker()
     def jump_style(self,name):
-        self.style_index=next(i for i,style in enumerate(STYLES) if style["name"]==name);self.generate()
+        self.style_index=next(i for i,style in enumerate(STYLES) if style["name"]==name)
+        if self.style_window is not None and self.style_window.winfo_exists():self.style_window.destroy();self.style_window=None
+        self.generate()
     def capture_theme(self):
+        self.theme_anchor=self.project.clone();self.song_path_anchor=self.project.clone()
+        self.song_scene_index=0;self.song_path_queued=None;self.song_path_event=None
+        self.auto_variation=0;self.auto_last_cycle=self.core.completed_cycles
+        self._rebuild_song_path()
+
+    def _rebuild_song_path(self):
+        if self.project.song_path not in SONG_PATHS:self.project.song_path="LIFT"
+        tokens=SONG_PATHS[self.project.song_path]
+        self.song_scenes=[(token,build_song_scene(self.song_path_anchor,token)) for token in tokens]
+
+    @staticmethod
+    def _copy_pattern(project):
+        return [[Step(step.note,step.velocity,step.effect) for step in channel] for channel in project.pattern]
+
+    def _apply_song_scene_locked(self,index):
+        if not self.song_scenes:return
+        self.song_scene_index=index%len(self.song_scenes)
+        token,scene=self.song_scenes[self.song_scene_index]
+        self.project.pattern=self._copy_pattern(scene);self.project.progression=scene.progression
         self.theme_anchor=self.project.clone();self.auto_variation=0;self.auto_last_cycle=self.core.completed_cycles
+        if self.project.vox.automation=="AUTO":
+            # AUTO changes the pad pattern at the four-bar scene boundary; it
+            # never injects an extra unscheduled vocal or overwrites the chosen
+            # one-to-three-word chant. Words and loop automation are independent.
+            self.vox_variation+=1
+            self.project.vox.loop=generate_vox_loop(self.project,self.vox_variation)
+        self.song_path_event=(token,scene.progression)
+
+    def _audio_cycle_boundary(self,_completed_cycles):
+        if self.song_path_queued is not None:return
+        if self.path_hold or not self.project.song_path_enabled or not self.song_scenes:return
+        self._apply_song_scene_locked((self.song_scene_index+1)%len(self.song_scenes))
+
+    def _audio_bar_boundary(self,_bar,_completed_cycles):
+        if self.song_path_queued is None:return
+        target=self.song_path_queued;self.song_path_queued=None
+        self._apply_song_scene_locked(target)
+
+    def _queue_scene(self,index):
+        index%=max(1,len(self.song_scenes));token=self.song_scenes[index][0]
+        if self.core.playing:
+            if self.song_path_queued==index:
+                self.song_path_queued=None;self.status.set("SCENE CUE CANCELED")
+            else:
+                self.song_path_queued=index;self.status.set(f"QUEUED {self.scene_display_name(index)} // LANDS NEXT BAR")
+        else:
+            with self.core.lock:self._apply_song_scene_locked(index)
+            self.status.set(f"SONG MAP {self.project.song_path} // {self.scene_display_name(index)} READY")
+
+    def scene_display_name(self,index):
+        names=SONG_PATH_SCENE_NAMES.get(self.project.song_path,SONG_PATHS.get(self.project.song_path,("A",)))
+        return names[index%len(names)]
+
+    def open_song_path_picker(self):
+        if self.path_window is not None and self.path_window.winfo_exists():self.path_window.lift();self.path_window.focus_force();return
+        win=tk.Toplevel(self.root,bg=BG);self.apply_window_icon(win);self.path_window=win;win.title("CHOOSE SONG PATH");win.geometry("650x500");win.minsize(560,440)
+        tk.Label(win,text="CHOOSE A SONG PATH",fg=CYAN,bg=BG,font=(MONO,16,"bold")).pack(anchor="w",padx=18,pady=(18,4))
+        tk.Label(win,text="Each path is four related harmonic scenes. Automatic moves land every four bars; manual cues land on the next bar.",fg=MUTED,bg=BG,font=(MONO,9),wraplength=610,justify="left").pack(anchor="w",padx=18,pady=(0,12))
+        descriptions={
+            "LOOP":"Steady groove with a repeating variation.","LIFT":"Familiar groove, rising change, contrast, then home.",
+            "JOURNEY":"The clearest departure, climax and return.","BUILD":"Low energy into tension and a full drop.",
+            "VERSE/HOOK":"Song form for hip-hop, pop and vocal space.","DREAM":"Drifting harmony with an airy breakdown and return.",
+        }
+        for name in SONG_PATHS:
+            row=tk.Frame(win,bg=PANEL,highlightbackground=CYAN if name==self.project.song_path else GRID,highlightthickness=1);row.pack(fill="x",padx=18,pady=3)
+            self.button(row,name,lambda selected=name:self.select_song_path(selected),PINK if name==self.project.song_path else CYAN,"diamond",width=13).pack(side="left",padx=5,pady=5)
+            stages="  →  ".join(SONG_PATH_SCENE_NAMES[name])
+            text=tk.Frame(row,bg=PANEL);text.pack(side="left",fill="x",expand=True,padx=5,pady=4)
+            tk.Label(text,text=stages,fg=LIME,bg=PANEL,font=(MONO,9,"bold"),anchor="w").pack(fill="x")
+            tk.Label(text,text=descriptions[name],fg=MUTED,bg=PANEL,font=(MONO,8),anchor="w").pack(fill="x")
+        def closed():self.path_window=None;win.destroy()
+        self.button(win,"CLOSE",closed,WHITE,"clear").pack(anchor="e",padx=18,pady=12);win.protocol("WM_DELETE_WINDOW",closed)
+
+    def select_song_path(self,name):
+        if name not in SONG_PATHS:return
+        self.project.song_path=name;self._rebuild_song_path();self.song_scene_index=0;self._queue_scene(0)
+        if self.path_window is not None and self.path_window.winfo_exists():self.path_window.destroy();self.path_window=None
+
+    def queue_next_scene(self):
+        self._queue_scene((self.song_scene_index+1)%max(1,len(self.song_scenes)))
+
+    def queue_home_scene(self):
+        tokens=SONG_PATHS.get(self.project.song_path,("A",))
+        target=next((index for index,token in enumerate(tokens) if token=="HOME"),0);self._queue_scene(target)
+
+    def toggle_path_hold(self):
+        self.path_hold=not self.path_hold;self.project.song_path_enabled=not self.path_hold
+        self.status.set("LOOPING CURRENT SCENE // MANUAL CUES STILL ACTIVE" if self.path_hold else "SONG PATH RUNNING // AUTOMATIC FOUR-BAR MOVES")
+
+    def update_path_controls(self):
+        if not self.song_scenes:return
+        next_index=self.song_path_queued if self.song_path_queued is not None else (self.song_scene_index+1)%len(self.song_scenes)
+        self.path_btn.configure(text=f"PATH {self.project.song_path}")
+        self.path_hold_btn.configure(text="RUN PATH" if self.path_hold else "LOOP SCENE")
+        self.path_next_btn.configure(text=f"QUEUED {self.scene_display_name(next_index)}" if self.song_path_queued is not None else "CUE NEXT")
+        home_tokens=SONG_PATHS.get(self.project.song_path,("A",));home_index=next((index for index,token in enumerate(home_tokens) if token=="HOME"),0)
+        home_disabled=self.project.pattern==self.song_scenes[home_index][1].pattern and self.song_path_queued is None
+        self.path_home_btn.configure(state="disabled" if home_disabled else "normal")
+        self.draw_song_map()
+
+    def draw_song_map(self):
+        c=self.path_map;c.delete("all");w=max(420,c.winfo_width());h=max(68,c.winfo_height());gap=9;pad=7;card_w=(w-pad*2-gap*3)/4
+        names=SONG_PATH_SCENE_NAMES.get(self.project.song_path,SONG_PATHS[self.project.song_path])
+        rows_until_bar=16-self.core.current_row%16;beats=max(1,math.ceil(rows_until_bar/4))
+        for index,((token,scene),name) in enumerate(zip(self.song_scenes,names)):
+            x=pad+index*(card_w+gap);active=index==self.song_scene_index;queued=index==self.song_path_queued
+            fill="#10313a" if active else "#102919" if queued else "#0a141d";outline=CYAN if active else LIME if queued else GRID
+            c.create_rectangle(x,4,x+card_w,h-5,fill=fill,outline=outline,width=3 if active or queued else 1)
+            c.create_text(x+8,13,anchor="w",text=f"{index+1}  {name}",fill=CYAN if active else LIME if queued else WHITE,font=(MONO,9,"bold"))
+            c.create_text(x+8,33,anchor="w",text=f"{token}  {scene.progression}",fill=WHITE if active or queued else MUTED,font=(MONO,7,"bold"))
+            state="PLAYING" if active else f"QUEUED · {beats} BEAT{'S' if beats!=1 else ''}" if queued else "UP NEXT" if index==(self.song_scene_index+1)%4 else ""
+            c.create_text(x+8,51,anchor="w",text=state,fill=CYAN if active else LIME if queued else AMBER,font=(MONO,7,"bold"))
+            if active and self.core.playing:
+                progress=(self.core.current_row%16)/16;c.create_rectangle(x+3,h-9,x+3+(card_w-6)*progress,h-6,fill=PINK,outline="")
     def cycle_auto_mutate(self):
         was_off=self.AUTO_LOOP_INTERVALS[self.auto_interval_index]==0
         self.auto_interval_index=(self.auto_interval_index+1)%len(self.AUTO_LOOP_INTERVALS)
         interval=self.AUTO_LOOP_INTERVALS[self.auto_interval_index]
-        if was_off and interval:self.capture_theme()
+        if was_off and interval:
+            self.theme_anchor=self.project.clone();self.auto_variation=0
         self.auto_last_cycle=self.core.completed_cycles
         if interval:
-            self.status.set(f"AUTO MUTATE EVERY {interval*4} BARS // PRIMARY THEME LOCKED")
+            self.status.set(f"EVOLVE EVERY {interval*4} BARS // CHANGES DETAILS INSIDE THE ACTIVE SCENE")
         else:
-            self.status.set("AUTO MUTATE OFF // CURRENT VARIATION HELD")
+            self.status.set("EVOLVE OFF // SONG PATH HARMONY CONTINUES")
         self.update_auto_button()
     def update_auto_button(self):
         interval=self.AUTO_LOOP_INTERVALS[self.auto_interval_index]
         if not interval:
-            self.auto_btn.configure(text="AUTO OFF")
+            self.auto_btn.configure(text="EVOLVE OFF")
             return
         elapsed=max(0,self.core.completed_cycles-self.auto_last_cycle)*self.project.rows+self.core.current_row
         bars=max(1,math.ceil(max(0,interval*self.project.rows-elapsed)/16))
-        self.auto_btn.configure(text=f"AUTO {interval*4}B > {bars}B")
+        self.auto_btn.configure(text=f"EVOLVE {interval*4}B · {bars}B")
     def maybe_auto_mutate(self):
         interval=self.AUTO_LOOP_INTERVALS[self.auto_interval_index]
         if not interval or not self.core.playing:return
@@ -680,9 +1098,9 @@ class Workstation:
             changes=theme_variation(self.project,self.theme_anchor,self.auto_variation)
         phase=(self.auto_variation-1)%8+1
         if changes:
-            self.status.set(f"AUTO VARIATION {phase}/8 // {changes} MUSICAL CHANGES // THEME LOCKED")
+            self.status.set(f"EVOLVE {phase}/8 // {changes} DETAIL CHANGES // HARMONY HELD")
         else:
-            self.status.set("AUTO VARIATION 8/8 // PRIMARY THEME RETURNS")
+            self.status.set("EVOLVE 8/8 // ORIGINAL PERFORMANCE RETURNS")
     def change_tempo(self,_=None):self.project.bpm=int(self.bpm.get())
     def change_swing(self,_=None):self.project.swing=float(self.swing.get())
     def toggle_insert(self):self.insert=not self.insert;self.insert_btn.configure(text=f"INSERT {'ON' if self.insert else 'OFF'}")
@@ -720,13 +1138,16 @@ class Workstation:
     def load_state(self):
         target=self.slot_path()
         if not target.exists():messagebox.showinfo("Empty state",f"State {self.state_slot.get()} is empty.");return
+        self.smooth_change(lambda:self._load_state_now(target),f"LOAD STATE {self.state_slot.get()}")
+    def _load_state_now(self,target):
         was=self.core.playing
         try:
-            loaded=TrackerProject.load(target);self.core.stop();self.project=loaded;self.core.project=loaded;self.core.reseed()
+            loaded=TrackerProject.load(target);self.core.stop();self.project=loaded;self.core.attach_project(loaded)
             self.style_index=next((i for i,s in enumerate(STYLES) if s["name"]==loaded.style),0)
             self.bpm.set(loaded.bpm);self.swing.set(loaded.swing);self.row=self.page=self.channel=0
             self.randomness.set(loaded.randomness*100);self.harmonic_motion.set(loaded.harmonic_motion*100)
             self.blend_target.set(loaded.blend_style or "NO BLEND");self.blend_amount.set(loaded.blend_amount*100);self.track_count.set(loaded.track_count)
+            self.path_hold=not loaded.song_path_enabled
             self.capture_theme();self.vis.match_style(loaded.style)
             if was:self.core.start(0)
             self.auto_last_cycle=self.core.completed_cycles
@@ -764,9 +1185,13 @@ class Workstation:
         messagebox.showinfo(
             "CHIPFORGE WORKSTATION CONTROLS",
             f"{self.GLOBAL_HOTKEYS}\n\n{self.MUSIC_HOTKEYS}\n\n{self.EDIT_HOTKEYS}\n\n{self.VISUAL_HOTKEYS}\n\n"
-            "VIEW\nThe gold View button cycles Split, Deck and Visual. Deck shows all four pages in a 2x2 grid. "
+            "VIEW\nThe gold View button cycles Split, Deck, Visual and Soundboard. Deck shows all four pages in a 2x2 grid. "
             "F6 swaps Deck and Visual while either has taken over. Escape exits OS fullscreen first, then returns takeover to Split.\n\n"
             "FLOW LAB\nBounded randomness, Music Math, style blending and 4 Core / 6 Full arrangement.\n\n"
+            "STYLES\nThe eight bank buttons are instant live shortcuts. ALL STYLES opens the complete thirty-six-style chooser.\n\n"
+            "SONG MAP\nThe four cards show the harmonic journey. Cyan is playing, green is queued. Automatic Path moves land every four bars; CUE NEXT and RETURN HOME land on the next bar. LOOP SCENE pauses automatic moves.\n\n"
+            "EVOLVE\nEvolve changes drums, fills and melodic details inside the active scene. It does not choose the harmony; the Song Path does that.\n\n"
+            "TRACK 7 SOUNDBOARD\nEight generated bass-vocal FX pads—not speech and not samples. Choose one to three curated vocal words: one is a stab, two is the default phrase, and three is a short chant. Cycle each visible word, add/remove the last slot, or randomize words independently. Manual pads quantize to the shared song clock. The sixteen cells are four bars of beat-sized loop memory. OFF keeps only live pads; LOOP repeats your fixed pattern; AUTO writes a new sparse one/two-hit loop at each Song Map scene without replacing your words. WOBBLE, DEEP and MUTANT carry sub-octave weight and tempo-locked filter motion. Press 7 to open the managed Soundboard takeover.\n\n"
             "The complete hotkey legend remains visible at the bottom of every view. In Insert mode the piano-row note keys take priority; press I to return to command mode."
         )
     def _next_vis(self):self.vis.cycle_scene(1)
@@ -776,14 +1201,21 @@ class Workstation:
     def _pixel(self):self.vis.pixel=not self.vis.pixel
     def _hud(self):self.vis.hud=not self.vis.hud
     def refresh(self):
+        if self.song_path_event is not None:
+            token,progression=self.song_path_event;self.song_path_event=None
+            self.status.set(f"SONG MAP {self.project.song_path} // {self.scene_display_name(self.song_scene_index)} // {progression}")
         self.maybe_auto_mutate();self.update_auto_button()
+        self.update_path_controls()
+        if self.core.playing and self.view_mode!="deck":self.page=self.core.current_row//16
         self.bpm.set(self.project.bpm);self.swing.set(self.project.swing)
         blend=f" × {self.project.blend_style} {int(self.project.blend_amount*100)}%" if self.project.blend_style else ""
-        self.meta.configure(text=f"{self.project.title}  //  {self.project.mode.upper()}  //  {self.project.progression}  //  R{int(self.project.randomness*100)} H{int(self.project.harmonic_motion*100)}{blend}")
+        self.meta.configure(text=f"{self.project.title}  //  {self.project.mode.upper()}  //  R{int(self.project.randomness*100)} H{int(self.project.harmonic_motion*100)}{blend}")
         if self.audio.error:self.status.set(self.audio.error)
         self.page_label.configure(text="ALL 4 PAGES // 2×2" if self.view_mode=="deck" else f"PAGE {self.page+1} / 4")
+        for button in self.page_nav_buttons:button.configure(state="disabled" if self.view_mode=="deck" else "normal")
         self.tracks_btn.configure(text="6 FULL" if self.project.track_count>=6 else "4 CORE")
         self.flow_btn.configure(text=f"FLOW R{int(self.project.randomness*100)} H{int(self.project.harmonic_motion*100)}")
+        self.update_vox_deck()
         self.draw_tracker();self.draw_meters();self.root.after(33,self.refresh)
     def draw_tracker(self):
         c=self.tracker;c.delete("all")
@@ -824,7 +1256,7 @@ class Workstation:
                     c.create_text(left+ch*cw+4,cy,anchor="w",text=text,fill=WHITE if step.note is not None else "#354958",font=(MONO,font_size))
     def draw_meters(self):
         self.meters.delete("all")
-        colors=(LIME,CYAN,AMBER,PINK,"#ff8a5b","#b967ff")
+        colors=(LIME,CYAN,AMBER,PINK,"#ff8a5b","#b967ff",WHITE)
         for i,v in enumerate(self.core.activity_levels()):
             x=i*31;self.meters.create_rectangle(x+2,4,x+29,25,outline=GRID);self.meters.create_rectangle(x+3,5,x+3+25*v,24,fill=colors[i],outline="")
     def close(self):

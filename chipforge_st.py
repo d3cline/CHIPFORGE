@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""CHIPFORGE ST — a six-lane terminal tracker and raw-PCM synthesizer.
+"""CHIPFORGE ST — a six-lane tracker, procedural VOX FX and PCM synth.
 
 The sound path is intentionally small: tracker rows drive six custom software
-voices, NumPy produces stereo PCM, and sounddevice sends signed 16-bit frames
-to PortAudio/ALSA. No samples, DAW, browser, or model download are required.
+voices plus a generated additive vowel oscillator. No samples, speech process,
+DAW, browser, or model download are required.
 """
 
 from __future__ import annotations
@@ -29,9 +29,10 @@ except ImportError as exc:  # pragma: no cover - friendly startup failure
 
 
 APP = "CHIPFORGE ST"
-VERSION = "1.3.0"
+VERSION = "3.4.1"
 CHANNEL_NAMES = ("DRUM", "BASS", "CHORD", "LEAD", "PERC", "AIR")
 CHANNEL_COUNT = len(CHANNEL_NAMES)
+VOX_CHANNEL = CHANNEL_COUNT  # Track 7: quantized performance soundboard.
 DRUM_CHANNELS = frozenset((0, 4))
 WAVEFORMS = ("SINE", "SQUARE", "SAW", "TRIANGLE", "PULSE", "ORGAN", "FM", "RING", "METAL", "NOISE",
              "WOBBLE", "REESE", "LIQUID", "GROWL", "BUBBLE", "ROUND", "VELVET", "RUBBER", "DUBSUB", "HOLLOW",
@@ -101,6 +102,29 @@ class Instrument:
 
 
 @dataclass
+class VoxSettings:
+    """Persistent controls for the procedural vocal-effects layer."""
+
+    # One to three curated vocal hits. This is deliberately not free text: each
+    # word maps to a stable musical formant shape that survives a dense mix.
+    phrase: str = "OH / AH"
+    voice: str = "WOBBLE"
+    mode: str = "PUNCH"
+    automation: str = "LOOP"
+    bend: float = 0.06
+    clock: float = 0.02
+    slap: float = 0.24
+    hook: bool = False
+    muted: bool = False
+    # Sixteen beat-sized cells form an independent four-bar Track 7 loop.
+    # Strings keep project files readable and make old saves easy to upgrade.
+    loop: list[str] = field(default_factory=lambda: [
+        "---", "---", "---", "---", "---", "---", "CHOP", "---",
+        "---", "---", "---", "---", "---", "---", "WUB", "---",
+    ])
+
+
+@dataclass
 class TrackerProject:
     title: str = "UNTITLED CIRCUIT"
     style: str = "NEON NOIR"
@@ -116,6 +140,9 @@ class TrackerProject:
     blend_amount: float = 0.0
     track_count: int = 4
     progression: str = "i - VI - III - VII"
+    song_path: str = "LIFT"
+    song_path_enabled: bool = True
+    vox: VoxSettings = field(default_factory=VoxSettings)
     instruments: list[Instrument] = field(default_factory=list)
     pattern: list[list[Step]] = field(default_factory=list)
 
@@ -127,7 +154,7 @@ class TrackerProject:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema": 2,
+            "schema": 6,
             "app": APP,
             "version": VERSION,
             "title": self.title,
@@ -144,6 +171,9 @@ class TrackerProject:
             "blend_amount": self.blend_amount,
             "track_count": self.track_count,
             "progression": self.progression,
+            "song_path": self.song_path,
+            "song_path_enabled": self.song_path_enabled,
+            "vox": asdict(self.vox),
             "instruments": [asdict(item) for item in self.instruments],
             "pattern": [[asdict(step) for step in channel] for channel in self.pattern],
         }
@@ -154,6 +184,47 @@ class TrackerProject:
         instruments = [Instrument(**item) for item in data.get("instruments", [])]
         raw_pattern = data.get("pattern", [])
         pattern = [[Step(**step) for step in channel] for channel in raw_pattern]
+        raw_vox = data.get("vox") or {}
+        if not isinstance(raw_vox, dict):
+            raw_vox = {}
+        vox_fields = VoxSettings.__dataclass_fields__
+        vox = VoxSettings(**{key: value for key, value in raw_vox.items() if key in vox_fields})
+        vox.phrase = normalize_vox_phrase(vox.phrase)
+        # V3.0/V3.1 projects stored speech characters and delivery modes. Map
+        # their timbral intent onto the new musical FX engine, but deliberately
+        # discard old free-text phrases: feeding them back into the failed
+        # speech path would make an upgraded project noisy again.
+        vox.voice = {
+            "SPELL": "WOBBLE", "GIANT": "DEEP", "GREMLIN": "MUTANT",
+            "CHOIR": "CHOIR", "TERMINAL": "ROBOT",
+        }.get(vox.voice, vox.voice)
+        vox.mode = {
+            "CHANT": "PUNCH", "MELODY": "TUNE", "RHYTHM": "CHOP",
+            "ORACLE": "AIR",
+        }.get(vox.mode, vox.mode)
+        vox.voice = vox.voice if vox.voice in VOX_VOICES else "WOBBLE"
+        vox.mode = vox.mode if vox.mode in VOX_MODES else "PUNCH"
+        # V3.2 ASSIST prepared phrases but never performed them. Its closest
+        # soundboard equivalent is the fixed LOOP: the player owns the pattern,
+        # while AUTO is the only mode that rewrites it at Song Map boundaries.
+        if vox.automation == "ASSIST":
+            vox.automation = "LOOP"
+        vox.automation = vox.automation if vox.automation in VOX_AUTOMATION else "LOOP"
+        valid_loop = list(vox.loop) if isinstance(vox.loop, (list, tuple)) else []
+        vox.loop = [str(item).upper() if str(item).upper() in VOX_PAD_ACTIONS else "---"
+                    for item in valid_loop[:16]]
+        vox.loop.extend(["---"] * (16 - len(vox.loop)))
+        vox.bend = clamp(float(vox.bend), 0.0, 1.0)
+        vox.clock = clamp(float(vox.clock), 0.0, 1.0)
+        vox.slap = clamp(float(vox.slap), 0.0, 1.0)
+        # Migrate the exact over-damaged 3.0.0 retail defaults. Deliberate user
+        # edits survive; only the known bad untouched combination is revoiced.
+        if str(data.get("version", "")) == "3.0.0" and all((
+            abs(vox.bend - .36) < 1e-6,
+            abs(vox.clock - .18) < 1e-6,
+            abs(vox.slap - .58) < 1e-6,
+        )):
+            vox.bend, vox.clock, vox.slap = .06, .02, .24
         source_channels = len(pattern) if pattern else len(instruments)
         if source_channels == 4:
             defaults = default_instruments()
@@ -174,6 +245,9 @@ class TrackerProject:
             blend_amount=clamp(float(data.get("blend_amount", 0.0)), 0.0, 1.0),
             track_count=6 if int(data.get("track_count", source_channels or 4)) >= 6 else 4,
             progression=str(data.get("progression", "i - VI - III - VII")),
+            song_path=str(data.get("song_path", "LIFT")),
+            song_path_enabled=bool(data.get("song_path_enabled", True)),
+            vox=vox,
             instruments=instruments,
             pattern=pattern,
         )
@@ -206,6 +280,376 @@ def default_instruments() -> list[Instrument]:
     ]
 
 
+# VOX FX is a small generated instrument in the signal path, but its musical
+# job is punctuation. It makes pitched vowel gestures rather than attempting
+# free-form speech. The spectra below are synthesized from harmonics at render
+# time; there are no recordings, soundbanks, TTS processes, or model downloads.
+VOX_VOICES = ("WOBBLE", "DEEP", "SOUL", "MUTANT", "CHOIR", "RAVE", "ROBOT")
+VOX_MODES = ("PUNCH", "TUNE", "CHOP", "AIR")
+VOX_AUTOMATION = ("OFF", "LOOP", "AUTO")
+VOX_PAD_ACTIONS = ("CALL", "HOOK", "CHOP", "BEND", "ECHO", "FREEZE", "ANSWER", "WUB")
+VOX_PAD_LABELS = {
+    "CALL": "STAB", "HOOK": "DROP", "CHOP": "CHOP", "BEND": "DIVE",
+    "ECHO": "THROW", "FREEZE": "HOLD", "ANSWER": "REPLY", "WUB": "WUB",
+}
+VOX_WORDS = ("OH", "AH", "OOH", "HEY", "YEAH", "YO", "AY", "UH", "EE", "EH", "HA")
+VOX_WORD_PHONEMES = {
+    "OH": "OW", "AH": "AA", "OOH": "UW", "HEY": "EY", "YEAH": "EH",
+    "YO": "OW", "AY": "EY", "UH": "AA", "EE": "IY", "EH": "EH", "HA": "AA",
+}
+VOX_WORD_ALIASES = {"OO": "OOH", "AA": "AH", "OW": "OH", "UW": "OOH", "IY": "EE", "EY": "HEY"}
+VOX_GESTURES: dict[str, tuple[str, ...]] = {
+    "AH / OH": ("AA", "OW"),
+    "OH / HEY": ("OW", "EY"),
+    "OO / AH": ("UW", "AA"),
+    "EH / OH": ("EH", "OW"),
+    "AH / EE": ("AA", "IY"),
+    "OH / OO": ("OW", "UW"),
+}
+
+# Three vowel-formant centers and broad musical bandwidths. Unlike the removed
+# speech renderer, these are used to weight an additive harmonic bank directly;
+# the result stays pitched, clean, and repeatable even in a dense mix.
+VOWEL_SPECS: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {
+    "AA": ((760, 1160, 2700), (170, 210, 330)),
+    "EH": ((560, 1840, 2480), (150, 250, 350)),
+    "EY": ((460, 2080, 2750), (140, 270, 380)),
+    "IY": ((310, 2250, 3000), (125, 285, 400)),
+    "OW": ((470, 880, 2550), (145, 180, 360)),
+    "UW": ((330, 820, 2200), (125, 175, 330)),
+}
+VOWEL_GLIDES = {"EY": "IY", "OW": "UW"}
+
+
+def parse_vox_words(value: str) -> list[str]:
+    """Return one to three supported vocal words from a saved/display phrase."""
+    text = str(value).upper().replace("|", "/")[:80]
+    raw = [item.strip() for item in text.split("/")] if "/" in text else text.split()
+    words=[]
+    for item in raw:
+        word=VOX_WORD_ALIASES.get(item,item)
+        if word in VOX_WORDS:
+            words.append(word)
+        if len(words)==3:break
+    return words
+
+
+def normalize_vox_phrase(value: str) -> str:
+    words=parse_vox_words(value)
+    return " / ".join(words or ("OH","AH"))
+
+
+def vox_phrase_palette(value: str) -> tuple[str, ...]:
+    words=parse_vox_words(value) or ["OH","AH"]
+    return tuple(VOX_WORD_PHONEMES[word] for word in words)
+
+
+def generate_vox_phrase(project: "TrackerProject", variation: int = 0, response: bool = False,
+                        action: str = "CALL") -> str:
+    """Choose a deterministic one-, two- or three-word musical vocal hit."""
+    action = "ANSWER" if response else action.upper()
+    rng = random.Random(project.seed + int(variation) * 7919 + sum(map(ord, action)) * 257)
+    if project.style in HIPHOP_STYLE_NAMES:
+        choices = ("YO", "UH", "OH", "HEY", "AH", "YEAH")
+    elif project.style in VAPORWAVE_STYLE_NAMES or project.style in LOFI_STYLE_NAMES:
+        choices = ("OOH", "OH", "AH", "EE", "EH")
+    elif project.bpm >= 120:
+        choices = ("HEY", "YO", "AY", "AH", "OH", "YEAH")
+    else:
+        choices = VOX_WORDS
+    count = rng.choices((1,2,3),weights=(20,55,25),k=1)[0]
+    words=[]
+    for _ in range(count):
+        available=tuple(word for word in choices if not words or word!=words[-1]) or choices
+        words.append(rng.choice(available))
+    return " / ".join(words)
+
+
+def generate_vox_loop(project: "TrackerProject", variation: int = 0) -> list[str]:
+    """Build a sparse, deterministic four-bar soundboard performance.
+
+    Track 7 is punctuation, not another melody lane. One anchor hit is always
+    present; a second pickup appears on alternating variations. Both live in
+    the back half of a bar so kick, bass and chord keep ownership of downbeats.
+    """
+    rng = random.Random(project.seed ^ 0x70A7 ^ (int(variation) * 65537))
+    loop = ["---"] * 16
+    primary_slots = (6, 7, 10, 11, 14, 15)
+    if project.bpm >= 132:
+        actions = ("CHOP", "WUB", "BEND", "CALL")
+    elif project.style in HIPHOP_STYLE_NAMES:
+        actions = ("WUB", "CALL", "CHOP", "BEND")
+    else:
+        actions = ("WUB", "CHOP", "BEND", "ECHO", "CALL")
+    first = rng.choice(primary_slots)
+    loop[first] = rng.choice(actions)
+    if variation % 2 == 1 or rng.random() < .28:
+        choices = [slot for slot in (3, 7, 11, 15) if abs(slot - first) >= 4]
+        if choices:
+            loop[rng.choice(choices)] = rng.choice(("CALL", "HOOK", "WUB"))
+    return loop
+
+
+@dataclass
+class VoxSegment:
+    phoneme: str
+    samples: int
+    pitch: float
+    stress: float = 1.0
+    target_pitch: float | None = None
+
+
+class VoxEngine:
+    """Streaming additive vowel oscillator for beat-locked DJ gestures."""
+
+    PROFILES = {
+        # register, formant scale, tilt, vibrato, breath, chorus, drive,
+        # sub-octave weight, tempo-filter wobble, phase warp
+        "WOBBLE": (40, .74, 1.38, .004, .004, .0012, .24, .52, .42, .08),
+        "DEEP":   (36, .70, 1.44, .003, .004, .0008, .22, .62, .30, .04),
+        "SOUL":   (47, .91, 1.25, .009, .010, .0016, .13, .24, .18, .03),
+        "MUTANT": (41, .79, 1.18, .007, .006, .0018, .38, .44, .62, .13),
+        "CHOIR":  (48, .92, 1.28, .011, .008, .0042, .08, .18, .14, .02),
+        "RAVE":   (50, .96, 1.12, .006, .005, .0010, .32, .30, .48, .10),
+        "ROBOT":  (43, .84, 1.10, .000, .002, .0000, .28, .36, .54, .09),
+    }
+
+    def __init__(self, settings: VoxSettings, sample_rate: int, seed: int):
+        self.settings = settings; self.sample_rate = sample_rate; self.seed = seed
+        self.rng = np.random.default_rng(seed ^ 0x51A7)
+        self.segments: list[VoxSegment] = []; self.segment_index = 0; self.segment_pos = 0
+        self.phase = 0.0; self.sub_phase = 0.0; self.noise_z = 0.0; self.post_z = 0.0
+        self.delay = np.zeros(max(1024, sample_rate * 2), dtype=np.float32); self.delay_pos = 0
+        self.tail_frames = 0; self.action = "CALL"; self.trigger_count = 0
+        self.bend_boost_frames = 0; self.slap_boost_frames = 0; self.level = 0.0
+        self.effect_send_start = 0; self.speech_beats = 0.0; self.target_samples = 0
+        self.bpm = 118
+
+    @property
+    def active(self) -> bool:
+        return self.segment_index < len(self.segments) or self.tail_frames > 0
+
+    @property
+    def phoneme(self) -> str:
+        if self.segment_index < len(self.segments):
+            return self.segments[self.segment_index].phoneme
+        return "---"
+
+    @property
+    def duck_depth(self) -> float:
+        return {"HOOK": .54, "CALL": .34, "ANSWER": .30, "CHOP": .24,
+                "BEND": .30, "ECHO": .26, "FREEZE": .18}.get(self.action, .28)
+
+    def reseed(self, seed: int) -> None:
+        self.seed = seed; self.rng = np.random.default_rng(seed ^ 0x51A7)
+
+    def stop(self) -> None:
+        self.segments = []; self.segment_index = self.segment_pos = self.tail_frames = 0
+        self.delay.fill(0.0); self.phase = self.sub_phase = 0.0; self.level = 0.0
+
+    def punch_bend(self, seconds: float = .55) -> None:
+        self.bend_boost_frames = max(self.bend_boost_frames, int(self.sample_rate * seconds))
+
+    def punch_echo(self, seconds: float = 1.0) -> None:
+        self.slap_boost_frames = max(self.slap_boost_frames, int(self.sample_rate * seconds))
+
+    @staticmethod
+    def _recipe(action: str, palette: tuple[str, ...]) -> list[tuple[str, float, int, int, float]]:
+        """Return token, beat length, start interval, end interval, accent."""
+        first=palette[0];second=palette[1] if len(palette)>1 else first;third=palette[2] if len(palette)>2 else second
+        if action == "HOOK":
+            # Three-part pickup: ah - ah - OHH, ending precisely on the downbeat.
+            return [(first,.16,0,0,.82),("SP",.09,0,0,0),(second,.16,0,2,.92),
+                    ("SP",.09,0,0,0),(third,.50,7,12,1.18)]
+        if action == "ANSWER":
+            return [("SP",.25,0,0,0),(second,.22,7,5,.92),("SP",.13,0,0,0),
+                    (third,.40,0,-2,1.08)]
+        if action == "CHOP":
+            output: list[tuple[str,float,int,int,float]] = []
+            for index in range(4):
+                token = palette[index % len(palette)]; interval = (0,7,3,7)[index]
+                output.extend(((token,.16,interval,interval,1.0 if index < 3 else 1.12),
+                               ("SP",.09,0,0,0)))
+            return output
+        if action == "WUB":
+            return [(first,.18,0,-12,1.08),("SP",.07,0,0,0),
+                    (second,.18,0,-5,1.12),("SP",.07,0,0,0),
+                    (third,.32,-5,-12,1.18),("SP",.18,0,0,0)]
+        if action == "BEND":
+            return [(third,1.0,12,-5,1.05)]
+        if action == "ECHO":
+            return [(third,.30,7,12,1.08),("SP",.70,0,0,0)]
+        if action == "FREEZE":
+            return [(third,2.0,0,7,.88)]
+        if len(palette)>=3:
+            return [(first,.14,0,2,.92),("SP",.08,0,0,0),(second,.14,7,5,1.0),
+                    ("SP",.08,0,0,0),(third,.20,3,0,1.12),("SP",.36,0,0,0)]
+        if len(palette)==1:
+            return [(first,.42,0,-2,1.10),("SP",.58,0,0,0)]
+        return [(first,.18,0,2,.94),("SP",.12,0,0,0),(second,.24,7,5,1.12),
+                ("SP",.46,0,0,0)]
+
+    def trigger(self, phrase: str, bpm: int, root: int, action: str = "CALL",
+                contour: Sequence[int] | None = None) -> None:
+        if self.settings.muted:
+            return
+        self.trigger_count += 1; self.action = action.upper(); self.bpm = max(40, bpm)
+        palette = vox_phrase_palette(phrase)
+        recipe = self._recipe(self.action, palette)
+        profile = self.PROFILES.get(self.settings.voice, self.PROFILES["SOUL"])
+        register = profile[0]
+        root_pc = root % 12
+        candidates = [note for note in range(28, 58) if note % 12 == root_pc]
+        base_note = min(candidates, key=lambda note: abs(note - register))
+        beat_samples = self.sample_rate * 60.0 / max(40, bpm)
+        event_beats = sum(item[1] for item in recipe)
+        target_samples = max(256, int(round(beat_samples * event_beats)))
+        durations = [max(32, int(round(beat_samples * item[1]))) for item in recipe]
+        durations[-1] += target_samples - sum(durations)
+
+        melodic = list(contour or ()); melodic_index = 0; self.segments = []
+        for (token, _beats, start_interval, end_interval, accent), samples in zip(recipe, durations):
+            start_note = base_note + start_interval; end_note = base_note + end_interval
+            if token != "SP" and self.settings.mode == "TUNE" and melodic:
+                start_note = melodic[melodic_index % len(melodic)]; melodic_index += 1
+                while start_note < 36: start_note += 12
+                while start_note > 55: start_note -= 12
+                end_note = start_note + (end_interval - start_interval)
+            if self.settings.mode == "AIR" and token != "SP":
+                start_note -= 5; end_note -= 5; accent *= .78
+            self.segments.append(VoxSegment(token, samples, note_frequency(start_note), accent,
+                                            note_frequency(end_note)))
+        audible = [index for index, segment in enumerate(self.segments) if segment.phoneme != "SP"]
+        self.effect_send_start = audible[-1] if audible else 0
+        self.speech_beats = event_beats; self.target_samples = target_samples
+        self.segment_index = self.segment_pos = 0; self.phase = self.sub_phase = 0.0
+        self.noise_z = self.post_z = 0.0; self.tail_frames = 0
+        if self.action == "ECHO": self.punch_echo(1.25)
+        if self.action == "BEND": self.punch_bend(.85)
+
+    def _render_segment(self, segment: VoxSegment, count: int) -> Any:
+        if segment.phoneme == "SP":
+            return np.zeros(count, dtype=np.float32)
+        register, formant_scale, tilt, vibrato, breath, chorus, drive, sub, wobble, warp = self.PROFILES.get(
+            self.settings.voice, self.PROFILES["WOBBLE"])
+        del register
+        positions = self.segment_pos + np.arange(count, dtype=np.float64)
+        progress = np.clip(positions / max(1.0, segment.samples - 1), 0.0, 1.0)
+        smooth = progress * progress * (3.0 - 2.0 * progress)
+        target_pitch = segment.target_pitch or segment.pitch
+        pitch = segment.pitch * np.power(target_pitch / max(1e-6, segment.pitch), smooth)
+        pitch *= 1.0 + vibrato * np.sin(2.0 * np.pi * positions / max(1.0, self.sample_rate * .18))
+        phase = (self.phase + np.cumsum(pitch / self.sample_rate)) % 1.0
+        self.phase = float(phase[-1])
+        warped_phase = (phase + warp * np.sin(2.0 * np.pi * phase * 2.0)) % 1.0
+
+        formants, bandwidths = VOWEL_SPECS[segment.phoneme]
+        center = float((segment.pitch + target_pitch) * .5)
+        midpoint = float(np.mean(progress))
+        if segment.phoneme in VOWEL_GLIDES:
+            target_formants, target_bandwidths = VOWEL_SPECS[VOWEL_GLIDES[segment.phoneme]]
+            glide = clamp((midpoint - .25) / .75, 0.0, 1.0)
+            formants = tuple(a + (b - a) * glide for a, b in zip(formants, target_formants))
+            bandwidths = tuple(a + (b - a) * glide for a, b in zip(bandwidths, target_bandwidths))
+        formants = tuple(value * formant_scale for value in formants)
+
+        harmonic_count = max(3, min(32, int((self.sample_rate * .45) / max(45.0, center))))
+        weights: list[float] = []
+        for harmonic in range(1, harmonic_count + 1):
+            frequency = center * harmonic
+            resonance = sum(gain * math.exp(-.5 * ((frequency - formant) / max(60.0, width)) ** 2)
+                            for formant, width, gain in zip(formants, bandwidths, (1.0,.72,.36)))
+            weights.append((.055 + resonance) / (harmonic ** tilt))
+        normalizer = max(.08, math.sqrt(sum(weight * weight for weight in weights)))
+        mono = np.zeros(count, dtype=np.float64)
+        chorus_phase = positions * center * chorus / self.sample_rate
+        for harmonic, weight in enumerate(weights, 1):
+            primary = np.sin(2.0 * np.pi * harmonic * warped_phase)
+            if chorus:
+                primary = (primary + .32 * np.sin(2.0 * np.pi * harmonic * (phase + chorus_phase))
+                           + .32 * np.sin(2.0 * np.pi * harmonic * (phase - chorus_phase))) / 1.64
+            mono += weight * primary
+        mono = mono / normalizer
+        if sub > 0.0:
+            sub_phase = (self.sub_phase + np.cumsum(pitch * .5 / self.sample_rate)) % 1.0
+            self.sub_phase = float(sub_phase[-1])
+            mono += sub * np.sin(2.0 * np.pi * sub_phase)
+
+        attack = self.sample_rate * (.048 if self.settings.mode == "AIR" else .010)
+        release = self.sample_rate * (.070 if self.settings.mode == "AIR" else .025)
+        envelope = np.minimum(1.0, positions / max(1.0, attack))
+        envelope *= np.minimum(1.0, (segment.samples - positions) / max(1.0, release))
+        envelope = np.clip(envelope, 0.0, 1.0)
+
+        if breath > 0.0:
+            noise = self.rng.normal(0.0, 1.0, count)
+            high_noise = np.empty(count, dtype=np.float64); z = self.noise_z
+            for index, sample in enumerate(noise):
+                high_noise[index] = float(sample) - z; z += .12 * (float(sample) - z)
+            self.noise_z = z
+            mono += high_noise * breath
+        mono *= envelope * segment.stress
+
+        bend = clamp(self.settings.bend + (.76 if self.bend_boost_frames > 0 else 0.0), 0.0, 1.0)
+        clock = clamp(self.settings.clock, 0.0, 1.0)
+        if bend > .18 or clock > .12:
+            steps = max(18, int(384 - bend * 300 - clock * 180))
+            mono = np.round(mono * steps) / steps
+        beat_hz = self.bpm / 60.0
+        rate = 2.0 if self.action in ("CHOP", "WUB") else .5
+        wobble_lfo = .5 + .5 * np.sin(2.0 * np.pi * positions / self.sample_rate * beat_hz * rate)
+        mono *= (1.0 - wobble * .28) + wobble * .28 * np.power(wobble_lfo, 1.35)
+        mono = np.tanh(mono * (1.12 + drive + bend * .80)) * .66
+        cutoff = (2200.0 + (1.0 - wobble) * 3600.0 - bend * 1700.0) * (.58 + .42 * wobble_lfo)
+        alpha = 1.0 - np.exp(-2.0 * np.pi * np.clip(cutoff, 520.0, 6800.0) / self.sample_rate)
+        filtered = np.empty(count, dtype=np.float32); z = self.post_z
+        for index, sample in enumerate(mono):
+            z += float(alpha[index]) * (float(sample) - z); filtered[index] = z
+        self.post_z = z
+        self.bend_boost_frames = max(0, self.bend_boost_frames - count)
+        return filtered
+
+    def _slap(self, dry: Any, bpm: int, send: float) -> Any:
+        amount = clamp(self.settings.slap + (.40 if self.slap_boost_frames > 0 else 0.0), 0.0, 1.0)
+        delay_samples = max(1, min(len(self.delay) - 1,
+                                  int(self.sample_rate * 60.0 / max(40, bpm) * .375)))
+        output = np.empty(len(dry), dtype=np.float32)
+        for index, sample in enumerate(dry):
+            read = (self.delay_pos - delay_samples) % len(self.delay); echo = float(self.delay[read])
+            output[index] = float(sample) + echo * (.08 + amount * .24)
+            self.delay[self.delay_pos] = float(sample) * clamp(send, 0.0, 1.0) + echo * (.06 + amount * .10)
+            self.delay_pos = (self.delay_pos + 1) % len(self.delay)
+        self.slap_boost_frames = max(0, self.slap_boost_frames - len(dry))
+        return output
+
+    def render(self, count: int, bpm: int) -> Any:
+        output = np.zeros(count, dtype=np.float32); cursor = 0
+        while cursor < count:
+            if self.segment_index < len(self.segments):
+                rendered_segment = self.segment_index
+                segment = self.segments[self.segment_index]
+                amount = min(count - cursor, segment.samples - self.segment_pos)
+                dry = self._render_segment(segment, amount); self.segment_pos += amount
+                if self.segment_pos >= segment.samples:
+                    self.segment_index += 1; self.segment_pos = 0
+                    if self.segment_index >= len(self.segments):
+                        tail_beats = 1.5 if self.action == "ECHO" else .55 if self.action == "HOOK" else .35
+                        self.tail_frames = int(self.sample_rate * 60.0 / max(40, bpm) * tail_beats)
+                send = (1.0 if rendered_segment >= self.effect_send_start else
+                        .30 if self.action == "CHOP" else .02)
+            elif self.tail_frames > 0:
+                amount = min(count - cursor, self.tail_frames); dry = np.zeros(amount, dtype=np.float32)
+                self.tail_frames -= amount; send = 0.0
+            else:
+                break
+            output[cursor:cursor + amount] = self._slap(dry, bpm, send); cursor += amount
+        peak = float(np.max(np.abs(output))) if len(output) else 0.0
+        self.level += (peak - self.level) * (.32 if peak > self.level else .08)
+        if not self.active and peak < 1e-4:
+            self.level *= .82
+        return output
+
+
 SCALE_MODES: dict[str, tuple[int, ...]] = {
     "aeolian": (0, 2, 3, 5, 7, 8, 10),
     "dorian": (0, 2, 3, 5, 7, 9, 10),
@@ -222,6 +666,149 @@ PROGRESSIONS: tuple[tuple[str, tuple[int, int, int, int], float], ...] = (
     ("i - iv - i - V", (0, 3, 0, 4), .62),
     ("i - i - VI - i", (0, 0, 5, 0), .16),
 )
+
+# Four related scenes make one sixteen-bar macro arrangement.  The names are
+# intentionally performance language rather than theory homework: players can
+# see where the set is going at a glance and can still inspect the actual Roman
+# numeral progression in the tracker header.
+SONG_PATHS: dict[str, tuple[str, str, str, str]] = {
+    "LOOP": ("A", "A2", "A", "A2"),
+    "LIFT": ("A", "A2", "B", "HOME"),
+    "JOURNEY": ("A", "B", "C", "HOME"),
+    "BUILD": ("LOW", "A", "TENSION", "DROP"),
+    "VERSE/HOOK": ("VERSE", "VERSE2", "HOOK", "TURN"),
+    "DREAM": ("A", "B", "BREAK", "A2"),
+}
+
+SONG_PATH_SCENE_NAMES: dict[str, tuple[str, str, str, str]] = {
+    "LOOP": ("GROOVE", "VARIATION", "GROOVE", "VARIATION"),
+    "LIFT": ("GROOVE", "LIFT", "CONTRAST", "HOME"),
+    "JOURNEY": ("OPEN", "DEPART", "CLIMAX", "HOME"),
+    "BUILD": ("LOW", "GROOVE", "TENSION", "DROP"),
+    "VERSE/HOOK": ("VERSE", "VERSE 2", "HOOK", "TURN"),
+    "DREAM": ("DREAM", "DRIFT", "BREAK", "RETURN"),
+}
+
+DEGREE_NAMES = ("i", "II", "III", "iv", "V", "VI", "VII")
+
+
+def progression_degrees(name: str) -> tuple[int, int, int, int]:
+    """Resolve a generated progression name while remaining safe for old saves."""
+    for progression_name, degrees, _motion in PROGRESSIONS:
+        if progression_name == name:
+            return degrees
+    roman = {"i": 0, "ii": 1, "iii": 2, "iv": 3, "v": 4, "vi": 5, "vii": 6}
+    parsed = tuple(roman.get(token.strip().lower(), -1) for token in name.split("-"))
+    if len(parsed) == 4 and all(degree >= 0 for degree in parsed):
+        return parsed
+    return PROGRESSIONS[0][1]
+
+
+def progression_name(degrees: Sequence[int]) -> str:
+    return " - ".join(DEGREE_NAMES[int(degree) % 7] for degree in degrees)
+
+
+def scene_progression(base: Sequence[int], scene: str) -> tuple[int, int, int, int]:
+    """Return a related four-bar progression for a plain-language scene."""
+    original = tuple(int(degree) % 7 for degree in base)
+    choices = {
+        "A": original,
+        "HOME": original,
+        "DROP": original,
+        "A2": (original[0], original[1], original[2], 4),
+        "B": (5, 2, 6, 0),
+        "C": (3, 5, 2, 4),
+        "LOW": (0, 0, 5, 0),
+        "TENSION": (3, 5, 4, 4),
+        "VERSE": (0, 6, 5, 6),
+        "VERSE2": (0, 6, 3, 4),
+        "HOOK": (5, 2, 6, 0),
+        "TURN": (3, 5, 4, 4),
+        "BREAK": (0, 0, 3, 4),
+    }
+    return choices.get(scene, original)
+
+
+def build_song_scene(theme: TrackerProject, scene: str, seed: int | None = None) -> TrackerProject:
+    """Reharmonize a frozen theme without discarding its recognizable motif.
+
+    Bass, lead and air notes move by the same diatonic distance as their bar's
+    chord.  Chord voices are rebuilt with close motion and correct scale quality.
+    A few deterministic arrangement moves give LOW/BREAK/DROP/HOOK their stage
+    meaning while the user's instruments, rhythm language and tracker edits stay
+    intact.
+    """
+    project = theme.clone()
+    scale = SCALE_MODES.get(theme.mode, SCALE_MODES["aeolian"])
+    source = progression_degrees(theme.progression)
+    target = scene_progression(source, scene)
+    project.progression = progression_name(target)
+    rng = random.Random(theme.seed * 65537 + sum(ord(char) for char in scene) if seed is None else seed)
+
+    def signed_degree_distance(old: int, new: int) -> int:
+        return (new - old + 3) % 7 - 3
+
+    def scale_move(note: int, distance: int) -> int:
+        relative = note - theme.root
+        octave, pitch_class = divmod(relative, 12)
+        index = min(range(len(scale)), key=lambda item: abs(scale[item] - pitch_class))
+        destination = index + distance
+        octave += destination // len(scale)
+        destination %= len(scale)
+        return theme.root + octave * 12 + scale[destination]
+
+    previous_chord: int | None = None
+    for bar, (old_degree, new_degree) in enumerate(zip(source, target)):
+        distance = signed_degree_distance(old_degree, new_degree)
+        start = bar * 16
+        for channel in (1, 3, 5):
+            for row in range(start, start + 16):
+                step = project.pattern[channel][row]
+                if step.note is not None:
+                    step.note = scale_move(step.note, distance)
+        chord_rows = [row for row in range(start, start + 16) if project.pattern[2][row].note is not None]
+        if not chord_rows:
+            chord_rows = [start]
+        root = theme.root + scale[new_degree] + 12
+        if previous_chord is not None:
+            root = min((root - 12, root, root + 12), key=lambda note: abs(note - previous_chord))
+        previous_chord = root
+        quality = diatonic_quality(scale, new_degree, seventh=any(project.pattern[2][row].effect in ("M7", "m7", "7TH") for row in chord_rows))
+        for row in chord_rows:
+            velocity = project.pattern[2][row].velocity or 9
+            project.pattern[2][row] = Step(root, velocity, quality)
+
+    # Scene-level stagecraft: obvious enough to hear, restrained enough that the
+    # theme remains the same song rather than a regenerated preset.
+    if scene in ("LOW", "BREAK"):
+        for row in range(project.rows):
+            pos = row % 16
+            if scene == "BREAK" and project.pattern[0][row].note is not None and pos not in (0, 8):
+                project.pattern[0][row] = Step()
+            if project.pattern[1][row].note is not None and pos != 0 and rng.random() < (.82 if scene == "BREAK" else .48):
+                project.pattern[1][row] = Step()
+            if project.pattern[3][row].note is not None and row % 4 and rng.random() < (.72 if scene == "BREAK" else .42):
+                project.pattern[3][row] = Step()
+            if project.pattern[4][row].note is not None and rng.random() < .78:
+                project.pattern[4][row] = Step()
+            if scene == "BREAK" and project.pattern[5][row].note is not None and rng.random() < .65:
+                project.pattern[5][row] = Step()
+    elif scene in ("DROP", "HOOK", "TENSION"):
+        for bar in range(4):
+            start = bar * 16
+            for pos in ((0, 4, 8, 12) if scene == "DROP" else (2, 6, 10, 14)):
+                row = start + pos
+                if project.pattern[0][row].note is None:
+                    project.pattern[0][row] = Step(36 if scene == "DROP" else 42, 9 if scene == "DROP" else 7, "HIT")
+            if project.pattern[2][start + 8].note is None:
+                anchor = project.pattern[2][start]
+                project.pattern[2][start + 8] = Step(anchor.note, max(7, anchor.velocity - 2), anchor.effect)
+    elif scene in ("A2", "VERSE2"):
+        for bar in range(4):
+            row = bar * 16 + 14
+            if project.pattern[0][row].note is None:
+                project.pattern[0][row] = Step(42 if bar < 3 else 46, 6 + bar // 2, "FLL")
+    return project
 
 
 def chord_intervals(effect: str) -> tuple[int, ...]:
@@ -291,6 +878,14 @@ STYLES: tuple[dict[str, Any], ...] = (
     {"name": "SUNDAY VINYL", "bpm": 86, "root": 41, "swing": 0.17, "density": 0.47, "waves": ("NOISE", "LOWRIDER", "DUSTY KEYS", "HOLLOW")},
     {"name": "LATE NIGHT HOMEWORK", "bpm": 80, "root": 35, "swing": 0.21, "density": 0.42, "waves": ("NOISE", "MALL BASS", "CASSETTE KEYS", "HOLLOW")},
     {"name": "COFFEE SHOP LOOP", "bpm": 90, "root": 40, "swing": 0.19, "density": 0.48, "waves": ("NOISE", "BOOM BAP", "CASSETTE KEYS", "TAPE FLUTE")},
+    {"name": "WAREHOUSE PULSE", "bpm": 132, "root": 33, "swing": 0.01, "density": 0.67, "waves": ("NOISE", "DUBSUB", "PULSE", "METAL")},
+    {"name": "ACID CONCRETE", "bpm": 138, "root": 31, "swing": 0.02, "density": 0.72, "waves": ("NOISE", "REESE", "RING", "FM")},
+    {"name": "MIDNIGHT HOUSE", "bpm": 124, "root": 36, "swing": 0.08, "density": 0.59, "waves": ("NOISE", "ROUND", "ORGAN", "VELVET")},
+    {"name": "FRENCH FILTER", "bpm": 120, "root": 40, "swing": 0.10, "density": 0.62, "waves": ("NOISE", "RUBBER", "DUSTY KEYS", "SAW")},
+    {"name": "JUNGLE CIRCUIT", "bpm": 172, "root": 29, "swing": 0.04, "density": 0.82, "waves": ("NOISE", "REESE", "HOLLOW", "FM")},
+    {"name": "LIQUID RUNNER", "bpm": 174, "root": 33, "swing": 0.03, "density": 0.74, "waves": ("NOISE", "DUBSUB", "VHS PAD", "TAPE FLUTE")},
+    {"name": "NIGHTDRIVE 84", "bpm": 110, "root": 36, "swing": 0.02, "density": 0.55, "waves": ("NOISE", "MALL BASS", "VHS PAD", "SAW")},
+    {"name": "LASER HORIZON", "bpm": 116, "root": 40, "swing": 0.01, "density": 0.61, "waves": ("NOISE", "ROUND", "PULSE", "FM")},
 )
 
 HIPHOP_STYLE_NAMES = frozenset({"808 BOOM BAP", "TRUNK RATTLE", "GOLDEN ERA DUST", "SOUTH SIDE 808",
@@ -655,6 +1250,12 @@ def generate_song(
             octave_shift, scale_index = divmod(degree, 7)
             project.pattern[5][12] = Step(project.root + 24 + octave_shift * 12 + scale[scale_index], 6, "AIR")
 
+    # Track 7 is regenerated with the musical world but remains independent of
+    # the six tracker lanes. Its one/two-hit four-bar loop supplies DJ-style
+    # punctuation without turning the arrangement into constant vocal chatter.
+    project.vox.phrase = generate_vox_phrase(project)
+    project.vox.loop = generate_vox_loop(project)
+
 
 def mutate_song(project: TrackerProject, amount: float = 0.14, seed: int | None = None) -> int:
     rng = random.Random(seed if seed is not None else random.randint(1, 2**31 - 1))
@@ -850,25 +1451,104 @@ class ScreenSpark:
 
 
 class SynthCore:
-    """Sample-accurate six-voice synth shared by live playback and export."""
+    """Sample-accurate music + procedural VOX FX shared by live/export."""
 
     def __init__(self, project: TrackerProject, sample_rate: int = 44100, solo: int | None = None):
         self.project = project
         self.sample_rate = sample_rate
         self.solo = solo
         self.voices = [Voice() for _ in range(CHANNEL_COUNT)]
+        self.vox = VoxEngine(project.vox, sample_rate, project.seed)
+        self.vox_pending: tuple[str, str, str, int] | None = None
+        self.vox_duck = 0.0
         self.current_row = 0
         self.sample_in_row = 0
         self.playing = False
         self.master = 0.82
+        self.output_gain = 1.0
+        self.output_gain_target = 1.0
         self.lock = threading.RLock()
         self.reseed()
         self.scope = np.zeros(512, dtype=np.float32)
         self._scope_cursor = 0
         self.completed_cycles = 0
+        self.cycle_callback = None
+        self.bar_callback = None
 
     def reseed(self) -> None:
         self.rngs = [np.random.default_rng(self.project.seed + channel * 1009) for channel in range(CHANNEL_COUNT)]
+        self.vox.settings = self.project.vox
+        self.vox.reseed(self.project.seed)
+
+    def attach_project(self, project: TrackerProject) -> None:
+        """Swap project state without leaving the VOX engine on stale settings."""
+        with self.lock:
+            self.project = project; self.vox.settings = project.vox; self.reseed()
+
+    def fire_vox(self, action: str = "CALL", phrase: str | None = None) -> None:
+        with self.lock:
+            self.vox.trigger(phrase or self.project.vox.phrase, self.project.bpm,
+                             self.project.root, action, self._vox_pitch_contour())
+
+    def _vox_pitch_contour(self) -> tuple[int, ...]:
+        """Borrow the coming lead shape; fall back to bass roots one octave up."""
+        notes = [self.project.pattern[3][(self.current_row + offset) % self.project.rows].note
+                 for offset in range(16)]
+        contour = [note for note in notes if note is not None]
+        if not contour:
+            bass = [self.project.pattern[1][(self.current_row + offset) % self.project.rows].note
+                    for offset in range(16)]
+            contour = [note + 12 for note in bass if note is not None]
+        return tuple(contour[:8])
+
+    def _next_vox_gap(self) -> int:
+        """Pick the quietest lead beat within the next bar."""
+        absolute = self.completed_cycles * self.project.rows + self.current_row
+        first = ((absolute // 4) + 1) * 4
+        candidates = []
+        for target in range(first, first + 16, 4):
+            row = target % self.project.rows
+            score = sum(self.project.pattern[3][(row + offset) % self.project.rows].note is not None
+                        for offset in range(8))
+            candidates.append((score, target))
+        return min(candidates, key=lambda item: (item[0], item[1]))[1]
+
+    def queue_vox(self, action: str = "CALL", phrase: str | None = None, quantize: str = "beat") -> None:
+        """Queue a prepared vocal gesture on a musical boundary."""
+        with self.lock:
+            if not self.playing:
+                self.fire_vox(action, phrase); return
+            absolute = self.completed_cycles * self.project.rows + self.current_row
+            if quantize == "gap": target = self._next_vox_gap(); boundary = "gap"
+            elif quantize == "bar": target = ((absolute // 16) + 1) * 16; boundary = "bar"
+            elif quantize == "turn":
+                # Start on beat four so a one-beat DROP gesture ends exactly
+                # where the next bar lands. If beat four has already begun,
+                # use the following bar rather than squeezing the cue late.
+                target = ((absolute // 16) + 1) * 16 - 4
+                if target <= absolute: target += 16
+                boundary = "turn"
+            else: target = ((absolute // 4) + 1) * 4; boundary = "beat"
+            self.vox_pending = (action, phrase or self.project.vox.phrase, boundary, target)
+
+    def set_output_gain(self, gain: float) -> None:
+        with self.lock:
+            self.output_gain_target = clamp(gain, 0.0, 1.0)
+
+    def _apply_output_ramp(self, output: Any) -> Any:
+        if len(output) == 0:
+            return output
+        start = self.output_gain
+        end = self.output_gain_target
+        if abs(end - start) < 1e-5:
+            output *= end
+            self.output_gain = end
+            return output
+        step = min(1.0, len(output) / max(1.0, self.sample_rate * 0.14))
+        finish = start + (end - start) * step
+        output *= np.linspace(start, finish, len(output), dtype=np.float32)[:, None]
+        self.output_gain = finish
+        return output
 
     def row_samples(self, row: int) -> int:
         base = self.sample_rate * 60.0 / self.project.bpm / 4.0
@@ -899,13 +1579,16 @@ class SynthCore:
             self.sample_in_row = 0
             self.completed_cycles = 0
             self.voices = [Voice() for _ in range(CHANNEL_COUNT)]
+            self.vox.stop(); self.vox_pending = None; self.vox_duck = 0.0
             self.playing = True
             self.trigger_row()
+            self._trigger_vox_loop_at_current_row()
 
     def stop(self) -> None:
         with self.lock:
             self.playing = False
             self.voices = [Voice() for _ in range(CHANNEL_COUNT)]
+            self.vox.stop(); self.vox_pending = None; self.vox_duck = 0.0
 
     def toggle(self) -> None:
         if self.playing:
@@ -919,10 +1602,36 @@ class SynthCore:
         with self.lock:
             self.trigger(channel, Step(note, 13, "AUD"))
 
+    def _trigger_vox_loop_at_current_row(self) -> bool:
+        """Fire Track 7's beat cell, if any, from the shared transport clock."""
+        if self.project.vox.muted or self.project.vox.automation not in ("LOOP", "AUTO"):
+            return False
+        if self.current_row % 4:
+            return False
+        beat = (self.current_row // 4) % 16
+        loop = self.project.vox.loop
+        action = loop[beat] if beat < len(loop) else "---"
+        if action not in VOX_PAD_ACTIONS:
+            return False
+        self.fire_vox(action)
+        return True
+
     def advance_row(self) -> None:
         self.current_row = (self.current_row + 1) % self.project.rows
         if self.current_row == 0:
             self.completed_cycles += 1
+            if self.cycle_callback is not None:
+                self.cycle_callback(self.completed_cycles)
+        if self.current_row % 16 == 0 and self.bar_callback is not None:
+            self.bar_callback(self.current_row // 16, self.completed_cycles)
+        fired = False
+        if self.vox_pending is not None:
+            action, phrase, _boundary, target = self.vox_pending
+            absolute = self.completed_cycles * self.project.rows + self.current_row
+            if absolute >= target:
+                self.vox_pending = None; self.fire_vox(action, phrase); fired = True
+        if not fired:
+            self._trigger_vox_loop_at_current_row()
         self.trigger_row()
 
     @staticmethod
@@ -1131,6 +1840,21 @@ class SynthCore:
             right = math.sin((pan + 1.0) * math.pi / 4.0)
             stereo[:, 0] += mono * left
             stereo[:, 1] += mono * right
+        if self.solo is None or self.solo == VOX_CHANNEL:
+            vox = self.vox.render(count, self.project.bpm)
+            # A gesture must own actual negative space. The depth is structural:
+            # a one-beat DROP pickup clears more room than a held background wash.
+            if self.solo is None:
+                envelope = np.empty(count, dtype=np.float32); state = self.vox_duck
+                attack = 1.0 - math.exp(-1.0 / max(1.0, self.sample_rate * .006))
+                release = 1.0 - math.exp(-1.0 / max(1.0, self.sample_rate * .090))
+                for index, sample in enumerate(vox):
+                    target = min(1.0, abs(float(sample)) * 5.0)
+                    state += (attack if target > state else release) * (target - state)
+                    envelope[index] = state
+                self.vox_duck = state
+                stereo *= (1.0 - self.vox.duck_depth * envelope)[:, None]
+            stereo[:, 0] += vox * .82; stereo[:, 1] += vox * .78
         return np.tanh(stereo * self.master).astype(np.float32)
 
     def render(self, frames: int) -> Any:
@@ -1140,6 +1864,7 @@ class SynthCore:
                 # The audio callback still advances audition voices while the
                 # tracker transport is stopped, so waveform design is immediate.
                 output[:] = self._render_chunk(frames)
+                output = self._apply_output_ramp(output)
                 mono = output.mean(axis=1)
                 if len(mono) >= len(self.scope):
                     self.scope[:] = mono[-len(self.scope) :]
@@ -1165,6 +1890,7 @@ class SynthCore:
                 if self.sample_in_row >= row_length:
                     self.sample_in_row = 0
                     self.advance_row()
+            output = self._apply_output_ramp(output)
             mono = output.mean(axis=1)
             if len(mono) >= len(self.scope):
                 self.scope[:] = mono[-len(self.scope) :]
@@ -1195,7 +1921,8 @@ class SynthCore:
                 age = voice.age / self.sample_rate
                 speed = 18.0 if channel in DRUM_CHANNELS else 1.0 / max(0.03, instrument.decay)
                 levels.append(clamp(voice.velocity * math.exp(-age * speed), 0.0, 1.0))
-            return tuple(levels)  # type: ignore[return-value]
+            levels.append(clamp(self.vox.level * 2.2, 0.0, 1.0))
+            return tuple(levels)
 
 
 class RawPCMOutput:
@@ -1323,6 +2050,8 @@ def export_project(project: TrackerProject, root: Path, sample_rate: int = 44100
     for channel, name in enumerate(CHANNEL_NAMES):
         stem = render_project(project, sample_rate, solo=channel)
         write_wav(folder / f"stem_{channel + 1}_{name.lower()}.wav", stem, sample_rate)
+    # VOX FX remains a performance layer rather than becoming tracker busywork.
+    write_wav(folder / "stem_7_vox.wav", render_project(project, sample_rate, solo=VOX_CHANNEL), sample_rate)
     write_midi(folder / "pattern.mid", project)
     project.save(folder / "project.json")
     return folder
@@ -1462,12 +2191,12 @@ class TrackerUI:
 
     def draw_performance_rack(self, screen: Any, y: int, width: int) -> None:
         levels = self.core.activity_levels()
-        colors = (3, 6, 2, 1, 4, 5)
+        colors = (3, 6, 2, 1, 4, 5, 7); names = CHANNEL_NAMES + ("VOX",)
         cursor_x = 2
         for channel, level in enumerate(levels):
             lit = int(round(level * 6))
             meter = "#" * lit + "." * (6 - lit)
-            label = f"{channel + 1}:{CHANNEL_NAMES[channel]:<5}[{meter}]"
+            label = f"{channel + 1}:{names[channel]:<5}[{meter}]"
             attr = self.color(colors[channel]) | (curses.A_BOLD if level > 0.08 else curses.A_DIM)
             self.safe_add(screen, y, cursor_x, label, attr)
             cursor_x += len(label) + 2

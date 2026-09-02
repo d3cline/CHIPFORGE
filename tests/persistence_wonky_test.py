@@ -46,7 +46,8 @@ with tempfile.TemporaryDirectory() as folder:
     loaded.instruments[1].waveform = "WOBBLE"
     output = export_project(loaded, root / "exports")
     expected = {"master.wav", "pattern.mid", "project.json",
-                *(f"stem_{index + 1}_{name.lower()}.wav" for index, name in enumerate(CHANNEL_NAMES))}
+                *(f"stem_{index + 1}_{name.lower()}.wav" for index, name in enumerate(CHANNEL_NAMES)),
+                "stem_7_vox.wav"}
     assert {item.name for item in output.iterdir()} == expected
     exported = TrackerProject.from_dict(json.loads((output / "project.json").read_text()))
     assert exported.to_dict() == loaded.to_dict()
